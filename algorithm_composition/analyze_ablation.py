@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         choices=["split", "coarse", "both"],
-        default="split",
+        default="coarse",
         help="Ablation granularity: split attn/MLP, coarse (both), or both.",
     )
     return parser.parse_args()

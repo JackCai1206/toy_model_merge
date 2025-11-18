@@ -122,7 +122,8 @@ run_ablation() {
     --batch_size "$BATCH_SIZE" \
     --device "$DEVICE" \
     --mode "$MODE" \
-    --output "$out"
+    --output "$out" \
+    --per_head 
 }
 
 attempt() {

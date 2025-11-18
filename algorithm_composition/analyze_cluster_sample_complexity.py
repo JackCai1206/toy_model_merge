@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 from typing import Dict, List
 
-AVAILABLE_METRICS = ["attention", "mlp", "joint"]
+AVAILABLE_METRICS = ["joint", "attention", "mlp"]
 
 
 def parse_args():

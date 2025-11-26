@@ -7,7 +7,7 @@ from typing import Dict, List
 
 import torch
 
-from utils.tokenizer import SimpleCharTokenizer
+from algorithm_composition.utils.tokenizer import SimpleCharTokenizer
 
 
 @dataclass

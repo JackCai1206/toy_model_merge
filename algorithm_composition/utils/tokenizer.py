@@ -14,9 +14,15 @@ ADDITIONAL_CHARS = ["[", "]", "/", " ", ":", "|", "-", "_", ".", ",", "<", ">", 
 class SimpleCharTokenizer(PreTrainedTokenizer):
     """Minimal character-level tokenizer tailored to the reverse-region tasks."""
 
-    def __init__(self) -> None:
+    def __init__(self, extra_chars: Iterable[str] | None = None) -> None:
         special_tokens = ["<pad>", "<s>", "</s>", "<unk>", "<sep>"]
-        self._all_tokens = special_tokens + BASE_CHARS + ADDITIONAL_CHARS
+        base_tokens = special_tokens + BASE_CHARS + ADDITIONAL_CHARS
+        extras: List[str] = []
+        for ch in extra_chars or []:
+            if ch in base_tokens or ch in extras:
+                continue
+            extras.append(ch)
+        self._all_tokens = base_tokens + extras
         self._token_to_id = {token: idx for idx, token in enumerate(self._all_tokens)}
         self._id_to_token = {idx: tok for tok, idx in self._token_to_id.items()}
 
@@ -27,6 +33,8 @@ class SimpleCharTokenizer(PreTrainedTokenizer):
             unk_token="<unk>",
             sep_token="<sep>",
         )
+        # Decoder-only models expect left padding to avoid shifting generation outputs.
+        self.padding_side = "left"
 
     @property
     def vocab_size(self) -> int:
@@ -87,10 +95,10 @@ class SimpleCharTokenizer(PreTrainedTokenizer):
         return (vocab_path,)
 
 
-def build_tokenizer() -> SimpleCharTokenizer:
+def build_tokenizer(extra_chars: Iterable[str] | None = None) -> SimpleCharTokenizer:
     """Helper used by scripts to obtain a fresh tokenizer instance."""
 
-    return SimpleCharTokenizer()
+    return SimpleCharTokenizer(extra_chars=extra_chars)
 
 
 def encode_prompt_with_sep(tokenizer: SimpleCharTokenizer, prompt: str) -> List[int]:

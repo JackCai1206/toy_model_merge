@@ -7,17 +7,28 @@ import logging
 import math
 import os
 import shutil
-from dataclasses import dataclass, field
+import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
-from transformers import TrainerCallback, TrainingArguments
 
-from models.llama_tiny_6L6H384 import build_nano_llama
-from utils.noop_trainer import CallbackOnlyTrainer
-from utils.tokenizer import SimpleCharTokenizer, build_tokenizer, encode_prompt_with_sep
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from arithemtic_scaling_law import (
+    CallbackOnlyTrainer,
+    S99Callback,
+    configure_training_args,
+    find_checkpoint_at_or_before,
+    list_checkpoint_steps,
+    measure_sample_complexity_with_recursive_rollback,
+)
+from algorithm_composition.models.llama_tiny_6L6H384 import build_nano_llama
+from algorithm_composition.utils.tokenizer import SimpleCharTokenizer, build_tokenizer, encode_prompt_with_sep
 
 
 logger = logging.getLogger(__name__)
@@ -34,41 +45,6 @@ class TrainingConfig:
     logging_steps: int = 500
 
 
-@dataclass
-class BranchState:
-    branch_id: int
-    output_dir: str
-    resume_checkpoint: str | None
-    eval_interval: int
-    rounds_completed: int
-    round_history: List[Dict[str, int | None]]
-    model: torch.nn.Module | None = None
-    pinned_checkpoints: List[str] = field(default_factory=list)
-
-
-class S99Callback(TrainerCallback):
-    """Stops training once accuracy ≥ threshold for patience evaluations."""
-
-    def __init__(self, metric_name: str, threshold: float = 0.99, patience: int = 5) -> None:
-        self.metric_name = metric_name
-        self.threshold = threshold
-        self.patience = patience
-        self.best_step: int | None = None
-        self._streak = 0
-
-    def on_evaluate(self, args, state, control, metrics, **kwargs):  # noqa: D401
-        value = metrics.get(self.metric_name)
-        if value is None:
-            self._streak = 0
-            return
-        if value >= self.threshold:
-            if self.best_step is None:
-                self.best_step = state.global_step
-            self._streak += 1
-            if self._streak >= self.patience:
-                control.should_training_stop = True
-        else:
-            self._streak = 0
 
 
 def make_compute_metrics(task_ids: Sequence[int], id_to_name: Dict[int, str]) -> callable:
@@ -142,53 +118,6 @@ def build_model_and_tokenizer(context_length: int = 256):
     return model, tokenizer
 
 
-def configure_training_args(
-    output_dir: str,
-    per_device_batch_size: int,
-    eval_batch_size: int,
-    grad_accum: int,
-    max_steps: int,
-    eval_steps: int,
-    logging_steps: int,
-    save_strategy: str = "no",
-    save_steps: int | None = None,
-    save_total_limit: int = 1,
-    scheduler_kwargs: Dict | None = None,
-) -> TrainingArguments:
-    warmup_steps = 2000
-    lr_scheduler_kwargs = dict(scheduler_kwargs or {})
-    if "num_decay_steps" not in lr_scheduler_kwargs:
-        lr_scheduler_kwargs["num_decay_steps"] = warmup_steps
-
-    return TrainingArguments(
-        output_dir=output_dir,
-        do_train=True,
-        do_eval=True,
-        per_device_train_batch_size=per_device_batch_size,
-        per_device_eval_batch_size=eval_batch_size,
-        gradient_accumulation_steps=grad_accum,
-        max_steps=max_steps,
-        learning_rate=3e-4,
-        weight_decay=0.1,
-        warmup_steps=warmup_steps,
-        lr_scheduler_type="warmup_stable_decay",
-        lr_scheduler_kwargs=lr_scheduler_kwargs,
-        eval_strategy="steps",
-        eval_steps=eval_steps,
-        logging_strategy="steps",
-        logging_steps=logging_steps,
-        save_strategy=save_strategy,
-        save_steps=save_steps,
-        save_total_limit=save_total_limit,
-        report_to="none",
-        fp16=False,
-        bf16=False,
-        dataloader_drop_last=False,
-        dataloader_num_workers=4,
-        remove_unused_columns=False,
-    )
-
-
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -210,28 +139,12 @@ def append_jsonl(path: str, payload: Dict) -> None:
         handle.write(json.dumps(payload) + "\n")
 
 
-def _list_checkpoint_steps(output_dir: str) -> List[int]:
-    if not os.path.isdir(output_dir):
-        return []
-    steps: List[int] = []
-    prefix = "checkpoint-"
-    for entry in os.scandir(output_dir):
-        if not entry.is_dir() or not entry.name.startswith(prefix):
-            continue
-        try:
-            step = int(entry.name[len(prefix) :])
-        except ValueError:
-            continue
-        steps.append(step)
-    return sorted(steps)
-
-
 def cleanup_checkpoints(output_dir: str, keep: int = 1) -> None:
     """Remove all but the most recent checkpoint directories."""
 
     if keep < 1:
         keep = 1
-    steps = _list_checkpoint_steps(output_dir)
+    steps = list_checkpoint_steps(output_dir)
     if len(steps) <= keep:
         return
 
@@ -243,26 +156,6 @@ def cleanup_checkpoints(output_dir: str, keep: int = 1) -> None:
         path = os.path.join(output_dir, f"checkpoint-{step}")
         if os.path.isdir(path):
             shutil.rmtree(path, ignore_errors=True)
-
-
-def find_checkpoint_at_or_before(output_dir: str, target_step: int) -> str | None:
-    """Return checkpoint path for the requested step, or the closest earlier one."""
-
-    desired = os.path.join(output_dir, f"checkpoint-{target_step}")
-    if os.path.isdir(desired):
-        return desired
-
-    steps = _list_checkpoint_steps(output_dir)
-    candidate = None
-    for step in steps:
-        if step <= target_step:
-            candidate = step
-        else:
-            break
-    if candidate is None:
-        return None
-    path = os.path.join(output_dir, f"checkpoint-{candidate}")
-    return path if os.path.isdir(path) else None
 
 
 def _strip_after_eos(ids: List[int], eos_token_id: int) -> List[int]:
@@ -402,162 +295,24 @@ def run_iterative_training_loop(
     rollback_branches: int = 1,
     success_threshold: float = 0.99,
 ) -> Tuple[CallbackOnlyTrainer, S99Callback, List[Dict[str, int | None]]]:
-    """Run training with iterative eval intervals, halving near the S99 threshold."""
+    """Delegate to the shared recursive rollback runner in arithemtic_scaling_law."""
 
-    refine_rounds = max(1, eval_refine_rounds)
-    branch_eval_steps = max(1, initial_eval_steps)
-    branch_count = max(1, rollback_branches)
-    branch_queue: List[BranchState] = [
-        BranchState(
-            branch_id=0,
-            output_dir=output_dir,
-            resume_checkpoint=None,
-            eval_interval=branch_eval_steps,
-            rounds_completed=0,
-            round_history=[],
-            model=initial_model,
-        )
-    ]
-    branched_once = False
-    next_branch_id = 0
-    best_trainer: CallbackOnlyTrainer | None = None
-    best_callback: S99Callback | None = None
-    best_round_history: List[Dict[str, int | None]] = []
-    best_steps: int | None = None
-
-    while branch_queue:
-        state = branch_queue.pop(0)
-        model = state.model
-        eval_interval = state.eval_interval
-        resume_checkpoint = state.resume_checkpoint
-        round_idx = state.rounds_completed
-        round_history = list(state.round_history)
-        trainer: CallbackOnlyTrainer | None = None
-        callback: S99Callback | None = None
-        split_state = False
-
-        while round_idx < refine_rounds:
-            if model is None:
-                model = model_builder()
-            training_args = configure_training_args(
-                output_dir=state.output_dir,
-                per_device_batch_size=per_device_batch_size,
-                eval_batch_size=per_device_eval_batch_size,
-                grad_accum=grad_accum,
-                max_steps=max_steps,
-                eval_steps=eval_interval,
-                logging_steps=eval_interval,
-                save_strategy="steps",
-                save_steps=eval_interval,
-                save_total_limit=2,
-            )
-            callback = S99Callback(metric_name=metric_name, threshold=success_threshold, patience=1)
-            trainer = CallbackOnlyTrainer(
-                model=model,
-                args=training_args,
-                train_dataset=train_dataset,
-                eval_dataset=eval_dataset,
-                tokenizer=tokenizer,
-                data_collator=data_collator,
-                compute_metrics=None,
-                callbacks=[callback],
-                eval_metrics_fn=greedy_eval_fn,
-            )
-            if state.pinned_checkpoints:
-                for checkpoint_path in state.pinned_checkpoints:
-                    trainer.pin_checkpoint(checkpoint_path)
-            train_kwargs = {}
-            if resume_checkpoint is not None:
-                train_kwargs["resume_from_checkpoint"] = resume_checkpoint
-            trainer.train(**train_kwargs)
-            trainer.save_state()
-            best_step = callback.best_step
-            round_history.append(
-                {
-                    "round": round_idx + 1,
-                    "eval_steps": eval_interval,
-                    "best_step": best_step,
-                    "branch": state.branch_id,
-                }
-            )
-            round_idx += 1
-            if best_step is None or round_idx >= refine_rounds:
-                break
-
-            previous_step = best_step - eval_interval
-            if previous_step <= 0:
-                break
-            resume_checkpoint = find_checkpoint_at_or_before(state.output_dir, previous_step)
-            if resume_checkpoint is None:
-                raise FileNotFoundError(
-                    f"Checkpoint not found at {os.path.join(state.output_dir, f'checkpoint-{previous_step}')}"
-                )
-            try:
-                actual_step = int(os.path.basename(resume_checkpoint).split("-", maxsplit=1)[-1])
-            except ValueError:
-                actual_step = previous_step
-            if actual_step != previous_step:
-                logger.warning(
-                    "Falling back to checkpoint %s (requested step %s).", resume_checkpoint, previous_step
-                )
-            if resume_checkpoint not in state.pinned_checkpoints:
-                state.pinned_checkpoints.append(resume_checkpoint)
-            eval_interval = max(1, eval_interval // 2)
-            state.eval_interval = eval_interval
-            model = None
-
-            if (
-                not branched_once
-                and branch_count > 1
-                and round_idx < refine_rounds
-            ):
-                pinned_checkpoints = list(state.pinned_checkpoints)
-                if resume_checkpoint not in pinned_checkpoints:
-                    pinned_checkpoints.append(resume_checkpoint)
-                branched_once = True
-                parent_history = list(round_history)
-                branch_states: List[BranchState] = [
-                    BranchState(
-                        branch_id=state.branch_id,
-                        output_dir=state.output_dir,
-                        resume_checkpoint=resume_checkpoint,
-                        eval_interval=eval_interval,
-                        rounds_completed=round_idx,
-                        round_history=parent_history.copy(),
-                        pinned_checkpoints=pinned_checkpoints,
-                    )
-                ]
-                for _ in range(branch_count - 1):
-                    next_branch_id += 1
-                    branch_output_dir = f"{output_dir}_branch{next_branch_id}"
-                    ensure_dir(branch_output_dir)
-                    branch_states.append(
-                        BranchState(
-                            branch_id=next_branch_id,
-                            output_dir=branch_output_dir,
-                            resume_checkpoint=resume_checkpoint,
-                            eval_interval=eval_interval,
-                            rounds_completed=round_idx,
-                            round_history=parent_history.copy(),
-                            pinned_checkpoints=[],
-                        )
-                    )
-                branch_queue = branch_states + branch_queue
-                split_state = True
-                break
-
-        if split_state:
-            continue
-        if trainer is None or callback is None:
-            continue
-
-        s99_steps = callback.best_step if callback.best_step is not None else trainer.args.max_steps
-        if best_steps is None or s99_steps < best_steps:
-            best_steps = s99_steps
-            best_trainer = trainer
-            best_callback = callback
-            best_round_history = list(round_history)
-
-    if best_trainer is None or best_callback is None:
-        raise RuntimeError("Iterative training failed to initialize Trainer.")
-    return best_trainer, best_callback, best_round_history
+    return measure_sample_complexity_with_recursive_rollback(
+        model_builder=model_builder,
+        initial_model=initial_model,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        greedy_eval_fn=greedy_eval_fn,
+        output_dir=output_dir,
+        per_device_batch_size=per_device_batch_size,
+        per_device_eval_batch_size=per_device_eval_batch_size,
+        grad_accum=grad_accum,
+        max_steps=max_steps,
+        initial_eval_steps=initial_eval_steps,
+        eval_refine_rounds=eval_refine_rounds,
+        metric_name=metric_name,
+        rollback_branches=rollback_branches,
+        success_threshold=success_threshold,
+    )

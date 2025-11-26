@@ -1,4 +1,4 @@
-"""Synthetic generator for commutative vs. non-commutative reverse tasks."""
+"""Synthetic generator for commutative vs. non-commutative reverse/sort tasks."""
 
 from __future__ import annotations
 
@@ -157,24 +157,48 @@ def reverse_inside(tokens: Sequence[str], span: RegionSpan) -> List[str]:
     return updated
 
 
+def sort_inside(tokens: Sequence[str], span: RegionSpan) -> List[str]:
+    """Sort the characters inside the provided span in ascending order."""
+
+    updated = list(tokens)
+    window = updated[span.start : span.end]
+    updated[span.start : span.end] = sorted(window)
+    return updated
+
+
+LABEL_OPERATORS = {
+    "A": reverse_inside,
+    "B": sort_inside,
+}
+
+TASK_TO_SEQUENCE = {
+    "A": ("A",),
+    "B": ("B",),
+    "C": ("A", "B"),
+}
+
+
+def _apply_operator_sequence(
+    tokens: Sequence[str], spans: Dict[str, RegionSpan], labels: Sequence[str]
+) -> List[str]:
+    current = list(tokens)
+    for label in labels:
+        operator = LABEL_OPERATORS.get(label)
+        if operator is None:
+            raise ValueError(f"Unsupported region label '{label}'.")
+        span = spans[label]
+        current = operator(current, span)
+    return current
+
+
 def apply_task(tokens: Sequence[str], spans: Dict[str, RegionSpan], task: str) -> List[str]:
-    """Apply task operator(s) returning a fresh token list."""
+    """Apply the task-specific operators (reverse A, sort B, or compose both)."""
 
     task = task.upper()
-    order_map = {
-        "A": ("A",),
-        "B": ("B",),
-        "C": ("A", "B"),
-    }
-    order = order_map.get(task)
+    order = TASK_TO_SEQUENCE.get(task)
     if order is None:
         raise ValueError(f"Unsupported task '{task}'.")
-
-    current = list(tokens)
-    for label in order:
-        span = spans[label]
-        current = reverse_inside(current, span)
-    return current
+    return _apply_operator_sequence(tokens, spans, order)
 
 
 def tokens_to_text(tokens: Sequence[str]) -> str:
@@ -187,7 +211,7 @@ def check_commutativity_once(sample: RegionSample) -> Tuple[bool, str, str]:
     """Return (is_commutative, A∘B text, B∘A text) for a sample."""
 
     a_then_b = apply_task(sample.tokens, sample.spans, "C")
-    b_then_a = reverse_inside(reverse_inside(sample.tokens, sample.spans["B"]), sample.spans["A"])
+    b_then_a = _apply_operator_sequence(sample.tokens, sample.spans, ("B", "A"))
     text_ab = tokens_to_text(a_then_b)
     text_ba = tokens_to_text(b_then_a)
     return a_then_b == b_then_a, text_ab, text_ba

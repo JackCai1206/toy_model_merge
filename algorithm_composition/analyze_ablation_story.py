@@ -137,6 +137,31 @@ def parse_args() -> argparse.Namespace:
             "Use 'max' to divide by the max per-task drop or 'l2' for L2 normalization.",
         ),
     )
+    parser.add_argument(
+        "--head_weight_mode",
+        type=str,
+        default="none",
+        choices=["none", "softmax"],
+        help=(
+            "If set, reweight per-head drops before concatenation. "
+            "'softmax' boosts the strongest head within each layer using a softmax-derived scale.",
+        ),
+    )
+    parser.add_argument(
+        "--head_softmax_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature parameter used when --head_weight_mode=softmax (must be > 0).",
+    )
+    parser.add_argument(
+        "--head_weight_boost",
+        type=float,
+        default=1.0,
+        help=(
+            "Additional multiplier applied to the softmax weight when boosting heads. "
+            "Higher values emphasize the max-influence head more strongly.",
+        ),
+    )
     return parser.parse_args()
 
 
@@ -186,6 +211,44 @@ def series_to_vector(series: Sequence[Dict[str, float]], entry_order: Sequence[E
 
 def has_head_dimensions(entry_order: Sequence[EntryKey]) -> bool:
     return any(head is not None for _, head in entry_order)
+
+
+def apply_head_weighting(
+    vector: np.ndarray,
+    entry_order: Sequence[EntryKey],
+    mode: str,
+    temperature: float,
+    boost: float,
+) -> np.ndarray:
+    if mode == "none" or not entry_order or not has_head_dimensions(entry_order):
+        return vector
+
+    if temperature <= 0.0:
+        raise ValueError("head_softmax_temperature must be positive.")
+
+    adjusted = vector.copy()
+    layer_to_indices: Dict[int, List[int]] = {}
+    for idx, (layer, head) in enumerate(entry_order):
+        if head is None:
+            continue
+        layer_to_indices.setdefault(layer, []).append(idx)
+
+    for indices in layer_to_indices.values():
+        if not indices:
+            continue
+        idx_array = np.array(indices, dtype=int)
+        values = vector[idx_array]
+        if np.all(values == 0.0):
+            continue
+        centered = (values - float(np.max(values))) / temperature
+        weights = np.exp(centered)
+        weight_sum = float(np.sum(weights))
+        if weight_sum == 0.0:
+            continue
+        weights /= weight_sum
+        adjusted[idx_array] = values * (1.0 + boost * weights)
+
+    return adjusted
 
 
 def aggregate_vector_by_layer(
@@ -239,6 +302,9 @@ def load_pretrain_vectors(
     metric: str,
     tasks: Sequence[str],
     max_runs: int | None,
+    head_weight_mode: str,
+    head_softmax_temperature: float,
+    head_weight_boost: float,
 ) -> Tuple[List[PretrainRun], str, Dict[str, List[int]], Dict[str, List[EntryKey]]]:
     ablation_dir = os.path.join(results_dir, "ablation", family)
     paths = sorted(glob.glob(os.path.join(ablation_dir, "*.json")))
@@ -289,6 +355,13 @@ def load_pretrain_vectors(
                 skip = True
                 break
             vector_part = series_to_vector(series, order)
+            vector_part = apply_head_weighting(
+                vector_part,
+                order,
+                mode=head_weight_mode,
+                temperature=head_softmax_temperature,
+                boost=head_weight_boost,
+            )
             partials.append(vector_part)
             per_task_vectors[task] = vector_part
         if skip:
@@ -780,40 +853,47 @@ def plot_cluster_layer_profiles(
         print(f"  Wrote {out_path}")
 
 
-def plot_cluster_head_heatmaps(
+def compute_head_heatmap_data(
     runs: Sequence[PretrainRun],
     labels: Sequence[int],
     tasks: Sequence[str],
     layer_orders: Dict[str, Sequence[int]],
     entry_orders: Dict[str, Sequence[EntryKey]],
-    metric: str,
-    plot_dir: str,
-) -> None:
-    if not plot_dir or not runs or not tasks:
-        return
-    base_dir = os.path.join(plot_dir, "cluster_head_heatmaps")
-    os.makedirs(base_dir, exist_ok=True)
+) -> Dict[int, Dict[str, Dict[str, object]]]:
     label_array = np.array(labels)
+    if label_array.size == 0:
+        return {}
 
-    for cluster_id in sorted(set(int(label) for label in labels)):
+    task_meta: Dict[str, Tuple[Sequence[int], Sequence[int]]] = {}
+    for task in tasks:
+        entry_order = entry_orders.get(task)
+        layer_ids = layer_orders.get(task)
+        if not entry_order or not layer_ids:
+            continue
+        if not has_head_dimensions(entry_order):
+            continue
+        head_ids = sorted({head for _, head in entry_order if head is not None})
+        if not head_ids:
+            continue
+        task_meta[task] = (layer_ids, head_ids)
+
+    if not task_meta:
+        return {}
+
+    heatmap_data: Dict[int, Dict[str, Dict[str, object]]] = {}
+    cluster_ids = sorted(set(int(label) for label in label_array))
+    for cluster_id in cluster_ids:
         indices = np.where(label_array == cluster_id)[0]
         if indices.size == 0:
             continue
-        for task in tasks:
-            entry_order = entry_orders.get(task)
-            layer_ids = layer_orders.get(task)
-            if not entry_order or not layer_ids:
-                continue
-            if not has_head_dimensions(entry_order):
-                continue
-            head_ids = sorted({head for _, head in entry_order if head is not None})
-            if not head_ids:
-                continue
+        per_task: Dict[str, Dict[str, object]] = {}
+        for task, (layer_ids, head_ids) in task_meta.items():
             layer_index = {layer: idx for idx, layer in enumerate(layer_ids)}
             head_index = {head: idx for idx, head in enumerate(head_ids)}
             grid_sum = np.zeros((len(layer_ids), len(head_ids)), dtype=np.float64)
             grid_count = np.zeros_like(grid_sum)
 
+            entry_order = entry_orders[task]
             for idx in indices:
                 vec = runs[idx].per_task_vectors.get(task)
                 if vec is None or vec.size == 0:
@@ -836,9 +916,49 @@ def plot_cluster_head_heatmaps(
                 out=np.zeros_like(grid_sum),
                 where=grid_count > 0,
             )
+            per_task[task] = {
+                "grid": mean_grid,
+                "layer_ids": list(layer_ids),
+                "head_ids": list(head_ids),
+            }
+        if per_task:
+            heatmap_data[cluster_id] = per_task
+
+    return heatmap_data
+
+
+def plot_cluster_head_heatmaps(
+    runs: Sequence[PretrainRun],
+    labels: Sequence[int],
+    tasks: Sequence[str],
+    layer_orders: Dict[str, Sequence[int]],
+    entry_orders: Dict[str, Sequence[EntryKey]],
+    metric: str,
+    plot_dir: str,
+) -> Dict[int, Dict[str, Dict[str, object]]]:
+    if not plot_dir or not runs or not tasks:
+        return {}
+    base_dir = os.path.join(plot_dir, "cluster_head_heatmaps")
+    os.makedirs(base_dir, exist_ok=True)
+
+    heatmap_data = compute_head_heatmap_data(
+        runs=runs,
+        labels=labels,
+        tasks=tasks,
+        layer_orders=layer_orders,
+        entry_orders=entry_orders,
+    )
+    if not heatmap_data:
+        return {}
+
+    for cluster_id, per_task in heatmap_data.items():
+        for task, info in per_task.items():
+            grid = info["grid"]  # type: ignore[index]
+            layer_ids = info["layer_ids"]  # type: ignore[index]
+            head_ids = info["head_ids"]  # type: ignore[index]
 
             fig, ax = plt.subplots(figsize=(6.0, 4.2))
-            im = ax.imshow(mean_grid, aspect="auto", origin="lower", cmap="viridis")
+            im = ax.imshow(grid, aspect="auto", origin="lower", cmap="viridis")
             ax.set_xticks(range(len(head_ids)))
             ax.set_xticklabels(head_ids)
             ax.set_yticks(range(len(layer_ids)))
@@ -856,6 +976,76 @@ def plot_cluster_head_heatmaps(
             plt.close(fig)
             print(f"  Wrote {out_path}")
 
+    return heatmap_data
+
+
+def plot_combined_head_heatmaps(
+    heatmap_data: Dict[int, Dict[str, Dict[str, object]]],
+    metric: str,
+    plot_dir: str,
+) -> None:
+    if not plot_dir or not heatmap_data:
+        return
+
+    clusters = sorted(heatmap_data.keys())
+    tasks = sorted({task for data in heatmap_data.values() for task in data.keys()})
+    if not clusters or not tasks:
+        return
+
+    n_rows = len(clusters)
+    n_cols = len(tasks)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.0 * n_cols, 3.5 * n_rows), squeeze=False)
+
+    vmin = min(
+        info["grid"].min()  # type: ignore[index]
+        for per_task in heatmap_data.values()
+        for info in per_task.values()
+    )
+    vmax = max(
+        info["grid"].max()  # type: ignore[index]
+        for per_task in heatmap_data.values()
+        for info in per_task.values()
+    )
+    if np.isclose(vmin, vmax):
+        vmax = vmin + 1e-6
+
+    for row, cluster_id in enumerate(clusters):
+        for col, task in enumerate(tasks):
+            ax = axes[row][col]
+            info = heatmap_data.get(cluster_id, {}).get(task)
+            if not info:
+                ax.axis("off")
+                continue
+            grid = info["grid"]  # type: ignore[index]
+            layer_ids = info["layer_ids"]  # type: ignore[index]
+            head_ids = info["head_ids"]  # type: ignore[index]
+            im = ax.imshow(grid, aspect="auto", origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
+            ax.set_xticks(range(len(head_ids)))
+            ax.set_xticklabels(head_ids)
+            ax.set_yticks(range(len(layer_ids)))
+            ax.set_yticklabels(layer_ids)
+            if row == n_rows - 1:
+                ax.set_xlabel(f"{task}: head index")
+            else:
+                ax.set_xlabel("")
+            if col == 0:
+                ax.set_ylabel(f"Cluster C{cluster_id}\nLayer")
+            else:
+                ax.set_ylabel("")
+
+    fig.suptitle(f"Mean drop per layer/head | Metric {metric}")
+    fig.tight_layout(rect=[0, 0, 0.92, 0.96])
+    cax = fig.add_axes([0.94, 0.15, 0.015, 0.7])
+    fig.colorbar(
+        plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(vmin=vmin, vmax=vmax)),
+        cax=cax,
+        label="Mean drop",
+    )
+    out_path = os.path.join(plot_dir, "cluster_head_heatmaps", f"all_clusters_{metric}_heatmaps.png")
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"  Wrote {out_path}")
+
 
 def main() -> None:
     args = parse_args()
@@ -865,6 +1055,9 @@ def main() -> None:
         metric=args.metric,
         tasks=args.tasks,
         max_runs=args.max_runs,
+        head_weight_mode=args.head_weight_mode,
+        head_softmax_temperature=args.head_softmax_temperature,
+        head_weight_boost=args.head_weight_boost,
     )
     def normalize(vec: np.ndarray) -> np.ndarray:
         if args.normalize_mode == "none":
@@ -915,7 +1108,7 @@ def main() -> None:
         plot_dir=args.plot_dir,
     )
 
-    plot_cluster_head_heatmaps(
+    heatmap_data = plot_cluster_head_heatmaps(
         runs=runs,
         labels=labels,
         tasks=args.tasks,
@@ -924,6 +1117,7 @@ def main() -> None:
         metric=metric_used,
         plot_dir=args.plot_dir,
     )
+    plot_combined_head_heatmaps(heatmap_data, metric_used, args.plot_dir)
 
     records = collect_sample_records(runs, labels, args.results_dir, args.scenarios)
     if not records:

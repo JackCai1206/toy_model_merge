@@ -125,3 +125,4 @@ dmypy.json
 artifacts
 data
 logs
+results

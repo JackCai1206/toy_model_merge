@@ -30,6 +30,7 @@ from algorithm_composition.utils.training import (
     build_model_from_tokenizer,
     cleanup_checkpoints,
     ensure_dir,
+    list_checkpoint_steps,
     write_json,
 )
 
@@ -70,8 +71,30 @@ def _strip_after_eos(ids: List[int], eos_token_id: int) -> List[int]:
     return trimmed
 
 
-def _parse_answer(text: str) -> int | None:
-    match = re.findall(r"-?\d+", text)
+def _parse_answer(gen_ids: List[int], tokenizer: SimpleCharTokenizer) -> int | None:
+    """Extract the final numeric answer from generated tokens.
+
+    First look for digits immediately following the last 'A' token to avoid
+    picking up intermediate step numbers; fall back to regex over decoded text.
+    """
+    tokens = tokenizer.convert_ids_to_tokens(gen_ids)
+    digits: List[str] = []
+    last_a_idx = None
+    for idx in range(len(tokens) - 1, -1, -1):
+        if tokens[idx] == "A":
+            last_a_idx = idx
+            break
+    if last_a_idx is not None:
+        for tok in tokens[last_a_idx + 1 :]:
+            if tok.isdigit():
+                digits.append(tok)
+            elif digits:
+                break
+        if digits:
+            return int("".join(digits)) % MODULUS
+
+    gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    match = re.findall(r"-?\d+", gen_text)
     if not match:
         return None
     return int(match[-1]) % MODULUS
@@ -156,7 +179,7 @@ class ArithmeticCoTDataset(Dataset):
 
 
 class OnlineArithmeticDataset(IterableDataset):
-    """Freshly generates samples every epoch for the requested levels."""
+    """Freshly generates samples every epoch for the requested levels, optionally mixing in prior levels."""
 
     def __init__(
         self,
@@ -167,13 +190,31 @@ class OnlineArithmeticDataset(IterableDataset):
         examples_per_epoch: int,
         regime: Regime,
         seed: int,
+        focus_level: int | None = None,
+        mix_prev_fraction: float = 0.0,
+        mix_prev_decay: float = 0.8,
     ) -> None:
-        self.levels = list(levels)
+        level_list = sorted(set(levels))
+        if focus_level is not None and focus_level not in level_list:
+            level_list.append(focus_level)
+            level_list.sort()
+        self.levels = level_list
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.examples_per_epoch = examples_per_epoch
         self.regime = regime
         self.seed = seed
+        self.focus_level = focus_level if focus_level is None or focus_level in self.levels else None
+        self.mix_prev_fraction = min(1.0, max(0.0, float(mix_prev_fraction)))
+        self.mix_prev_decay = float(mix_prev_decay) if mix_prev_decay > 0 else 1.0
+        self._prev_levels = (
+            [lvl for lvl in self.levels if self.focus_level is not None and lvl < self.focus_level]
+            if self.focus_level is not None
+            else []
+        )
+        self._prev_level_weights = [
+            self.mix_prev_decay ** max(1, self.focus_level - lvl) for lvl in self._prev_levels
+        ] if self._prev_levels else []
 
     def __iter__(self):
         from torch.utils.data import get_worker_info
@@ -193,11 +234,23 @@ class OnlineArithmeticDataset(IterableDataset):
         _, text_fields = self._sample_example(random.Random(self.seed + idx))
         return text_fields
 
+    def _sample_level(self, rng: random.Random) -> int:
+        if (
+            self.focus_level is None
+            or not self._prev_levels
+            or self.mix_prev_fraction <= 0.0
+            or rng.random() >= self.mix_prev_fraction
+        ):
+            # Default: stick to the focus level when provided, otherwise uniform across levels.
+            return self.focus_level if self.focus_level is not None else rng.choice(self.levels)
+        # Sample a previous level with exponential decay so recent levels are favored.
+        return rng.choices(self._prev_levels, weights=self._prev_level_weights, k=1)[0]
+
     def _sample_example(
         self, rng: random.Random
     ) -> tuple[Dict[str, torch.Tensor], Dict[str, str | int]]:
         while True:
-            k = rng.choice(self.levels)
+            k = self._sample_level(rng)
             example = generate_example(
                 k=k,
                 rng=rng,
@@ -246,6 +299,8 @@ def greedy_eval_arithmetic(
     max_new_tokens: int,
     batch_size: int,
     match_target_length: bool = False,
+    per_level_breakdown: bool = False,
+    include_counts: bool = False,
 ) -> Dict[str, float]:
     """Greedy decoding evaluation returning expression-level accuracy."""
 
@@ -256,6 +311,8 @@ def greedy_eval_arithmetic(
     token_hits = 0
     token_total = 0
     exact_matches = 0
+    per_level_total: Dict[int, int] = {}
+    per_level_correct: Dict[int, int] = {}
 
     with torch.no_grad():
         for start in range(0, total, batch_size):
@@ -292,12 +349,13 @@ def greedy_eval_arithmetic(
                 pad_token_id=tokenizer.pad_token_id,
             )
 
+            input_length = input_ids.shape[1]
             for row, item in enumerate(batch_items):
-                prompt_len = prompt_lens[row]
-                gen_ids = generated[row].tolist()[prompt_len:]
+                # Generation output includes the (left-padded) prompt; strip the full input length,
+                # not just the raw prompt tokens, to avoid leaking prompt tokens into eval parsing.
+                gen_ids = generated[row].tolist()[input_length:]
                 gen_ids = _strip_after_eos(gen_ids, tokenizer.eos_token_id)
-                gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-                pred_answer = _parse_answer(gen_text)
+                pred_answer = _parse_answer(gen_ids, tokenizer)
                 if pred_answer is not None and pred_answer == item["answer"]:
                     correct += 1
                 target_ids = tokenizer.encode(item["target"], add_special_tokens=False)
@@ -307,12 +365,27 @@ def greedy_eval_arithmetic(
                         token_hits += 1
                 if gen_ids == target_ids:
                     exact_matches += 1
+                if per_level_breakdown:
+                    level = int(item.get("complexity_k", -1)) if isinstance(item, dict) else -1
+                    per_level_total[level] = per_level_total.get(level, 0) + 1
+                    if pred_answer is not None and pred_answer == item["answer"]:
+                        per_level_correct[level] = per_level_correct.get(level, 0) + 1
 
-    return {
+    metrics: Dict[str, float] = {
         "eval_acc_expr": correct / max(total, 1),
         "eval_token_accuracy": token_hits / max(token_total, 1),
         "eval_exact_full": exact_matches / max(total, 1),
     }
+    if per_level_breakdown:
+        for level, count in sorted(per_level_total.items()):
+            hits = per_level_correct.get(level, 0)
+            metrics[f"eval_acc_expr_k{level}"] = hits / max(count, 1)
+    if include_counts:
+        metrics["eval_count_examples"] = total
+        metrics["eval_count_token_hits"] = token_hits
+        metrics["eval_count_token_total"] = token_total
+        metrics["eval_count_exact_matches"] = exact_matches
+    return metrics
 
 
 def make_eval_fn(
@@ -330,6 +403,93 @@ def make_eval_fn(
         batch_size=batch_size,
         match_target_length=match_target_length,
     )
+
+
+def load_model_for_eval(path: str):
+    """Load a checkpoint and place it on GPU if available so eval isn't CPU-bound."""
+
+    model = LlamaForCausalLM.from_pretrained(path)
+    if torch.cuda.is_available():
+        model = model.to("cuda")
+    return model
+
+
+def evaluate_levels_with_early_stop(
+    *,
+    model,
+    tokenizer: SimpleCharTokenizer,
+    regime: Regime,
+    levels: Iterable[int],
+    examples_per_level: int,
+    context_length: int,
+    max_new_tokens: int,
+    batch_size: int,
+    match_target_length: bool,
+    seed_base: int = 0,
+    show_progress: bool = False,
+    stop_threshold: float | None = None,
+) -> Dict[str, float]:
+    """Run greedy eval level-by-level and optionally stop early once accuracy dips to/below the threshold."""
+
+    level_list = sorted(levels)
+    aggregate_examples = 0
+    aggregate_correct = 0.0
+    aggregate_exact = 0.0
+    aggregate_token_hits = 0
+    aggregate_token_total = 0
+    metrics: Dict[str, float] = {}
+    levels_evaluated: List[int] = []
+
+    for idx, level in enumerate(level_list, start=1):
+        if show_progress:
+            print(f"[final eval] level k={level} ({idx}/{len(level_list)})", flush=True)
+        level_seed = seed_base + 23 * level
+        level_ds = OnlineArithmeticDataset(
+            levels=[level],
+            tokenizer=tokenizer,
+            max_length=context_length,
+            examples_per_epoch=examples_per_level,
+            regime=regime,
+            seed=level_seed,
+        )
+        level_metrics = greedy_eval_arithmetic(
+            model=model,
+            tokenizer=tokenizer,
+            dataset=level_ds,
+            max_new_tokens=max_new_tokens,
+            batch_size=batch_size,
+            match_target_length=match_target_length,
+            include_counts=True,
+        )
+        levels_evaluated.append(level)
+        level_count = len(level_ds)
+        metrics[f"eval_acc_expr_k{level}"] = level_metrics["eval_acc_expr"]
+        metrics[f"eval_exact_full_k{level}"] = level_metrics["eval_exact_full"]
+        metrics[f"eval_token_accuracy_k{level}"] = level_metrics["eval_token_accuracy"]
+
+        aggregate_examples += level_count
+        aggregate_correct += level_metrics["eval_acc_expr"] * level_count
+        aggregate_exact += level_metrics["eval_exact_full"] * level_count
+        aggregate_token_hits += int(level_metrics.get("eval_count_token_hits", 0))
+        aggregate_token_total += int(level_metrics.get("eval_count_token_total", 0))
+
+        acc = level_metrics["eval_acc_expr"]
+        if show_progress:
+            print(f"[final eval] level k={level} accuracy={acc:.4f}", flush=True)
+
+        if stop_threshold is not None and acc <= stop_threshold:
+            if show_progress:
+                print(
+                    f"[final eval] stopping after k={level} (accuracy={acc:.4f} <= threshold={stop_threshold:.2f})",
+                    flush=True,
+                )
+            break
+
+    metrics["eval_levels_evaluated"] = len(levels_evaluated)
+    metrics["eval_acc_expr"] = aggregate_correct / max(aggregate_examples, 1)
+    metrics["eval_exact_full"] = aggregate_exact / max(aggregate_examples, 1)
+    metrics["eval_token_accuracy"] = aggregate_token_hits / max(aggregate_token_total, 1)
+    return metrics
 
 
 # -----------------------------
@@ -356,6 +516,7 @@ def maybe_generate_split(
     regime: Regime,
     split: str,
     path: str,
+    k_min: int,
     k_max: int,
     examples_per_k: int,
     seed: int,
@@ -365,7 +526,7 @@ def maybe_generate_split(
         return
     ensure_dir(os.path.dirname(path))
     generate_dataset(
-        k_min=1,
+        k_min=k_min,
         k_max=k_max,
         examples_per_k=examples_per_k,
         q_keep=regime.q_keep,
@@ -380,6 +541,7 @@ def build_datasets_for_level(
     data_dir: str,
     regime: Regime,
     k: int,
+    k_min: int,
     tokenizer: SimpleCharTokenizer,
     max_length: int,
     train_examples: int,
@@ -390,12 +552,14 @@ def build_datasets_for_level(
     train_path = os.path.join(base, "train.jsonl")
     val_path = os.path.join(base, "val.jsonl")
     test_path = os.path.join(base, "test.jsonl")
+    level_range = range(k_min, k + 1)
+    level_count = max(k - k_min + 1, 1)
 
     train_ds = OnlineArithmeticDataset(
-        levels=range(1, k + 1),
+        levels=level_range,
         tokenizer=tokenizer,
         max_length=max_length,
-        examples_per_epoch=train_examples * k,
+        examples_per_epoch=train_examples * level_count,
         regime=regime,
         seed=seeds["train"],
     )
@@ -403,16 +567,16 @@ def build_datasets_for_level(
         path=val_path,
         tokenizer=tokenizer,
         max_length=max_length,
-        levels=range(1, k + 1),
-        sample_size=eval_examples * k,
+        levels=level_range,
+        sample_size=eval_examples * level_count,
         seed=seeds["val"],
     )
     test_ds = ArithmeticCoTDataset(
         path=test_path,
         tokenizer=tokenizer,
         max_length=max_length,
-        levels=range(1, k + 1),
-        sample_size=eval_examples * k,
+        levels=level_range,
+        sample_size=eval_examples * level_count,
         seed=seeds["test"],
     )
     return {"train": train_ds, "val": val_ds, "test": test_ds}
@@ -431,30 +595,45 @@ def train_level(
 
     run_dir = os.path.join(args.artifacts_dir, regime.slug, f"level_k{k}")
     ensure_dir(run_dir)
+    final_eval_examples = (
+        args.final_eval_examples_per_level
+        if args.final_eval_examples_per_level is not None
+        else args.eval_examples_per_level
+    )
+    level_range = range(args.k_min, k + 1)
 
     train_ds = OnlineArithmeticDataset(
-        levels=[k],
+        levels=level_range,
         tokenizer=tokenizer,
         max_length=args.context_length,
         examples_per_epoch=args.train_examples_per_level,
         regime=regime,
         seed=args.seed + 11 * k,
+        focus_level=k,
+        mix_prev_fraction=args.prev_level_mix_fraction,
+        mix_prev_decay=args.prev_level_mix_decay,
     )
     val_ds = OnlineArithmeticDataset(
-        levels=[k],
+        levels=level_range,
         tokenizer=tokenizer,
         max_length=args.context_length,
         examples_per_epoch=args.eval_examples_per_level,
         regime=regime,
         seed=args.seed + 13 * k,
+        focus_level=k,
+        mix_prev_fraction=args.prev_level_mix_fraction,
+        mix_prev_decay=args.prev_level_mix_decay,
     )
     test_ds = OnlineArithmeticDataset(
-        levels=[k],
+        levels=level_range,
         tokenizer=tokenizer,
         max_length=args.context_length,
-        examples_per_epoch=args.eval_examples_per_level,
+        examples_per_epoch=final_eval_examples,
         regime=regime,
         seed=args.seed + 17 * k,
+        focus_level=k,
+        mix_prev_fraction=args.prev_level_mix_fraction,
+        mix_prev_decay=args.prev_level_mix_decay,
     )
 
     eval_fn = make_eval_fn(
@@ -488,42 +667,92 @@ def train_level(
         initial_eval_steps=args.eval_steps,
         eval_refine_rounds=args.eval_refine_rounds,
         metric_name="eval_acc_expr",
+        resume_optimizer_state=bool(args.resume_optimizer_state),
+        warmup_steps=args.warmup_steps,
         rollback_branches=args.rollback_branches,
         success_threshold=args.acc_target,
     )
 
+    # Persist only the latest checkpoint from the best branch.
+    latest_steps = list_checkpoint_steps(trainer.args.output_dir)
+    latest_checkpoint = (
+        os.path.join(trainer.args.output_dir, f"checkpoint-{latest_steps[-1]}")
+        if latest_steps
+        else trainer.args.output_dir
+    )
+    if latest_steps:
+        print(
+            f"Finalizing level k={k}: using latest checkpoint {os.path.basename(latest_checkpoint)} from {trainer.args.output_dir}",
+            flush=True,
+        )
     trainer.save_model(run_dir)
     tokenizer.save_pretrained(run_dir)
-    cleanup_checkpoints(run_dir)
+    # Remove all checkpoint-* directories so only a single final checkpoint remains.
+    cleanup_checkpoints(trainer.args.output_dir, keep=0)
+    if trainer.args.output_dir != run_dir:
+        cleanup_checkpoints(run_dir, keep=0)
 
     final_best = callback.best_step if callback is not None else None
     if final_best is None:
         raise RuntimeError(f"Training did not reach threshold for k={k} under regime {regime.slug} before max_steps.")
     s99_steps = final_best or trainer.args.max_steps
+    eval_model = load_model_for_eval(run_dir)
     test_metrics = greedy_eval_arithmetic(
-        model=LlamaForCausalLM.from_pretrained(run_dir),
+        model=eval_model,
         tokenizer=tokenizer,
         dataset=test_ds,
         max_new_tokens=args.greedy_eval_max_new_tokens,
         batch_size=args.greedy_eval_batch_size,
         match_target_length=args.greedy_eval_match_target_length,
     )
+    all_levels_metrics = evaluate_levels_with_early_stop(
+        model=eval_model,
+        tokenizer=tokenizer,
+        regime=regime,
+        levels=range(args.k_min, args.k_max),
+        examples_per_level=final_eval_examples,
+        context_length=args.context_length,
+        max_new_tokens=args.greedy_eval_max_new_tokens,
+        batch_size=args.greedy_eval_batch_size,
+        match_target_length=args.greedy_eval_match_target_length,
+        seed_base=args.seed + 19 * k,
+        show_progress=True,
+        stop_threshold=args.final_eval_stop_threshold,
+    )
 
     return {
         "checkpoint": run_dir,
+        "k": k,
         "round_history": round_history,
         "s99_steps": s99_steps,
         "metrics": test_metrics,
+        "metrics_all_levels": all_levels_metrics,
     }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run scaling-law experiments for collapsed CoT arithmetic.")
+    parser.add_argument("--k_min", type=int, default=1, help="Minimum complexity level to start training (inclusive).")
     parser.add_argument("--k_max", type=int, default=6)
+    parser.add_argument("--run_name", type=str, default=None, help="Human-friendly run label (e.g., seed_123).")
+    parser.add_argument("--run_group", type=str, default=None, help="Group folder to cluster seeds/runs.")
     parser.add_argument("--q_keep", type=float, default=1.0, help="q_keep value for dataset corruption.")
     parser.add_argument("--max_block_size", type=int, default=1, help="max_block_size for dataset generation.")
     parser.add_argument("--train_examples_per_level", type=int, default=20000)
     parser.add_argument("--eval_examples_per_level", type=int, default=2000)
+    parser.add_argument(
+        "--final_eval_examples_per_level",
+        type=int,
+        default=500,
+        help="Examples per level for the final greedy eval only; set to eval_examples_per_level to match training eval size.",
+    )
+    parser.add_argument(
+        "--final_eval_stop_threshold",
+        type=float,
+        default=None,
+        help="Stop evaluating higher levels once accuracy falls to/below this threshold. "
+        "Use a negative value or omit to disable early stopping (default: disabled).",
+    )
     parser.add_argument("--data_dir", type=str, default="arithemtic_scaling_law/data")
     parser.add_argument("--artifacts_dir", type=str, default="arithemtic_scaling_law/artifacts")
     parser.add_argument("--results_dir", type=str, default="arithemtic_scaling_law/results")
@@ -531,31 +760,66 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--per_device_batch_size", type=int, default=16)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=32)
     parser.add_argument("--grad_accum", type=int, default=1)
-    parser.add_argument("--eval_steps", type=int, default=2000)
+    parser.add_argument("--eval_steps", type=int, default=1000)
     parser.add_argument("--eval_refine_rounds", type=int, default=4)
     parser.add_argument("--rollback_branches", type=int, default=1)
+    parser.add_argument(
+        "--prev_level_mix_fraction",
+        type=float,
+        default=0.2,
+        help="Fraction of samples drawn from previous levels (EMA weighted) when training level k.",
+    )
+    parser.add_argument(
+        "--prev_level_mix_decay",
+        type=float,
+        default=0.8,
+        help="Exponential decay factor for weighting earlier levels when mixing in previous-level samples.",
+    )
+    parser.add_argument(
+        "--resume_optimizer_state",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Whether to resume optimizer/scheduler state when continuing from a checkpoint (1=yes, 0=reinit).",
+    )
     parser.add_argument("--greedy_eval_batch_size", type=int, default=16)
     parser.add_argument("--greedy_eval_max_new_tokens", type=int, default=64)
     parser.add_argument("--greedy_eval_match_target_length", action="store_true")
     parser.add_argument("--max_steps", type=int, default=200000, help="Upper bound on steps per level.")
+    parser.add_argument("--warmup_steps", type=int, default=600, help="Optimizer warmup steps.")
     parser.add_argument("--acc_target", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--force_regen", action="store_true", help="Regenerate datasets even if they exist.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.k_min < 1:
+        raise ValueError(f"k_min must be >= 1 (got {args.k_min}).")
+    if args.k_min >= args.k_max:
+        raise ValueError(f"k_min ({args.k_min}) must be less than k_max ({args.k_max}).")
+    if args.warmup_steps < 0:
+        raise ValueError(f"warmup_steps must be non-negative (got {args.warmup_steps}).")
+    args.resume_optimizer_state = bool(args.resume_optimizer_state)
     set_seed(args.seed)
 
     regime = Regime(args.q_keep, args.max_block_size)
+    run_name = args.run_name or f"seed_{args.seed}"
+    run_group = args.run_group or f"run_{regime.slug}"
+    if args.run_group is None and args.k_min != 1:
+        run_group = f"{run_group}_kmin{args.k_min}"
     tokenizer = build_tokenizer(extra_chars=["(", ")", "+", "*"])
     data_collator = CausalLMDataCollator(tokenizer=tokenizer)
 
     seeds = {"train": args.seed + 1, "val": args.seed + 2, "test": args.seed + 3}
     base_checkpoint: str | None = None
+    total_levels = args.k_max - args.k_min
 
-    for k in range(1, args.k_max):
+    for idx, k in enumerate(range(args.k_min, args.k_max), start=1):
+        print(
+            f"=== Training level k={k} ({idx}/{total_levels}) | regime={regime.slug} | run_group={run_group} | run_name={run_name} ===",
+            flush=True,
+        )
         record = train_level(
             k=k,
             regime=regime,
@@ -566,9 +830,33 @@ def main() -> None:
         )
         base_checkpoint = record["checkpoint"]
         ensure_dir(args.results_dir)
+        record.update(
+            {
+                "run_name": run_name,
+                "run_group": run_group,
+                "seed": args.seed,
+                "regime": regime.as_dict(),
+                "regime_slug": regime.slug,
+                "results_dir": args.results_dir,
+                "artifacts_dir": args.artifacts_dir,
+            }
+        )
         write_json(
             os.path.join(args.results_dir, f"level_k{k}_{regime.slug}.json"),
             record,
+        )
+        metrics = record.get("metrics", {})
+        s99 = record.get("s99_steps")
+        def _fmt(v: float | None) -> str:
+            try:
+                return f"{float(v):.4f}"
+            except Exception:
+                return "n/a"
+        print(
+            f"[level k={k}] s99_steps={s99} | "
+            f"eval_acc_expr={_fmt(metrics.get('eval_acc_expr'))} | "
+            f"eval_exact_full={_fmt(metrics.get('eval_exact_full'))}",
+            flush=True,
         )
 
 

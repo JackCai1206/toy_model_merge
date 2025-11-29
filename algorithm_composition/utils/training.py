@@ -140,11 +140,19 @@ def append_jsonl(path: str, payload: Dict) -> None:
 
 
 def cleanup_checkpoints(output_dir: str, keep: int = 1) -> None:
-    """Remove all but the most recent checkpoint directories."""
+    """Remove checkpoint-* directories, keeping at most `keep` most recent."""
 
-    if keep < 1:
-        keep = 1
+    if keep < 0:
+        keep = 0
     steps = list_checkpoint_steps(output_dir)
+    if keep == 0:
+        # Remove all checkpoints.
+        for step in steps:
+            path = os.path.join(output_dir, f"checkpoint-{step}")
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+        return
+
     if len(steps) <= keep:
         return
 
@@ -292,6 +300,7 @@ def run_iterative_training_loop(
     initial_eval_steps: int,
     eval_refine_rounds: int,
     metric_name: str,
+    resume_optimizer_state: bool = True,
     rollback_branches: int = 1,
     success_threshold: float = 0.99,
 ) -> Tuple[CallbackOnlyTrainer, S99Callback, List[Dict[str, int | None]]]:
@@ -313,6 +322,7 @@ def run_iterative_training_loop(
         initial_eval_steps=initial_eval_steps,
         eval_refine_rounds=eval_refine_rounds,
         metric_name=metric_name,
+        resume_optimizer_state=resume_optimizer_state,
         rollback_branches=rollback_branches,
         success_threshold=success_threshold,
     )

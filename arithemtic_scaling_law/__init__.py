@@ -6,6 +6,7 @@ from .recursive_sample_complexity import (
     configure_training_args,
     find_checkpoint_at_or_before,
     list_checkpoint_steps,
+    train_with_eval_threshold,
     measure_sample_complexity_with_recursive_rollback,
     run_iterative_training_loop,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "configure_training_args",
     "find_checkpoint_at_or_before",
     "list_checkpoint_steps",
+    "train_with_eval_threshold",
     "measure_sample_complexity_with_recursive_rollback",
     "run_iterative_training_loop",
     "Node",

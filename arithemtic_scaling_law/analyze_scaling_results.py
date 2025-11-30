@@ -88,10 +88,14 @@ def group_by_k(records: List[Dict]) -> Dict[int, Dict[str, List[Tuple[int, float
 def plot_k_curves(k: int, curves: Dict[str, List[Tuple[int, float]]], metric: str, output_dir: str) -> str:
     os.makedirs(output_dir, exist_ok=True)
     plt.figure(figsize=(6.4, 4.6))
-    for slug, points in sorted(curves.items()):
+    slugs = sorted(curves.keys())
+    cmap = plt.get_cmap("viridis")
+    color_vals = np.linspace(0, 1, len(slugs) or 1)
+    for color, slug in zip(cmap(color_vals), slugs):
+        points = curves[slug]
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
-        plt.plot(xs, ys, marker="o", label=slug)
+        plt.plot(xs, ys, marker="o", label=slug, color=color)
     plt.title(f"k={k} sample complexity ({metric})")
     plt.xlabel("N fine-tune examples (k→k+1)")
     plt.ylabel(metric)
@@ -160,17 +164,125 @@ def aggregate_accuracy(records: List[Dict], metric_prefix: str) -> Dict[int, Dic
 
 
 def aggregate_sample_complexity(records: List[Dict]) -> Dict[int, Dict[str, float]]:
-    acc: Dict[int, List[float]] = defaultdict(list)
+    """Estimate crossing distribution using interval-censored bootstrap.
+
+    Each record is treated as having an interval [L, U] where U is the first
+    threshold-crossing eval step and L is the prior eval step. Missing
+    crossings are right-censored at max_steps.
+    """
+
+    def _infer_interval(rec: Dict) -> Tuple[float, float | None, float]:
+        eval_steps = rec.get("eval_steps") or None
+        thresholds: List[int] = list(rec.get("threshold_steps") or [])
+        thresholds = sorted(int(s) for s in thresholds)
+        max_steps = float(rec.get("max_steps") or rec.get("s99_steps") or thresholds[-1] if thresholds else 0)
+        if thresholds:
+            first = float(thresholds[0])
+            interval = float(eval_steps or (thresholds[1] - thresholds[0] if len(thresholds) >= 2 else first))
+            lower = max(0.0, first - interval)
+            upper = first
+            return lower, upper, max_steps
+        # Right-censored at max_steps when never crossed.
+        return float(max_steps), None, float(max_steps)
+
+    def _bootstrap_median(intervals: List[Tuple[float, float | None]], max_steps: float, samples: int = 500) -> Dict[str, float]:
+        if not intervals:
+            return {"median": float("nan"), "ci_low": float("nan"), "ci_high": float("nan")}
+        medians: List[float] = []
+        rng = np.random.default_rng(seed=0)
+        for _ in range(samples):
+            draw_vals: List[float] = []
+            for low, high in rng.choice(intervals, size=len(intervals), replace=True):
+                upper = max_steps if high is None else float(high)
+                lower = min(float(low), upper)
+                if upper > lower:
+                    val = rng.uniform(lower, upper)
+                else:
+                    val = upper
+                draw_vals.append(val)
+            medians.append(float(np.median(draw_vals)))
+        med_arr = np.array(medians, dtype=float)
+        return {
+            "median": float(np.median(med_arr)),
+            "ci_low": float(np.percentile(med_arr, 2.5)),
+            "ci_high": float(np.percentile(med_arr, 97.5)),
+        }
+
+    acc: Dict[int, List[Tuple[float, float | None]]] = defaultdict(list)
+    max_seen: Dict[int, float] = defaultdict(float)
+    fallback: Dict[int, List[float]] = defaultdict(list)
+
     for rec in records:
         k = int(rec.get("k", -1))
-        s99 = rec.get("s99_steps")
-        if s99 is None:
+        lower, upper, max_steps = _infer_interval(rec)
+        if lower == upper == 0:
             continue
-        acc[k].append(float(s99))
+        max_seen[k] = max(max_seen[k], max_steps)
+        acc[k].append((lower, upper))
+        s99 = rec.get("s99_steps")
+        if s99 is not None:
+            fallback[k].append(float(s99))
+
     stats: Dict[int, Dict[str, float]] = {}
-    for k, values in acc.items():
-        arr = np.array(values, dtype=float)
-        stats[k] = {"mean": float(np.mean(arr)), "std": float(np.std(arr)), "count": len(values)}
+    for k, intervals in acc.items():
+        max_steps = max_seen.get(k, max(fallback.get(k, [0.0])) or 0.0)
+        midpoints = []
+        for low, high in intervals:
+            upper = max_steps if high is None else high
+            lower = min(low, upper)
+            midpoints.append((lower + upper) / 2.0)
+        mid_arr = np.array(midpoints, dtype=float)
+
+        # Trim extreme midpoint outliers to keep downstream std/CI reasonable.
+        keep_mask = np.isfinite(mid_arr)
+        positive_mask = keep_mask & (mid_arr > 0)
+        if np.count_nonzero(positive_mask) >= 2:
+            vals = mid_arr[positive_mask]
+            q1, q3 = np.percentile(vals, [25, 75])
+            iqr = q3 - q1
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            keep_mask &= (mid_arr >= lower) & (mid_arr <= upper)
+        if np.count_nonzero(positive_mask) >= 1:
+            med = float(np.median(mid_arr[positive_mask]))
+            if med > 0:
+                keep_mask &= mid_arr <= med * 50.0
+        if not np.any(keep_mask):
+            keep_mask = np.isfinite(mid_arr)
+
+        trimmed_mid = mid_arr[keep_mask]
+        trimmed_intervals = [iv for iv, keep in zip(intervals, keep_mask) if keep]
+        intervals_for_boot = trimmed_intervals if trimmed_intervals else intervals
+        mid_for_stats = trimmed_mid if trimmed_mid.size else mid_arr
+
+        # Cap the effective max_steps for bootstrap to prevent heavy right-censor tails.
+        cap = None
+        if mid_for_stats.size:
+            cap = float(np.median(mid_for_stats) * 10.0)
+            if cap <= 0:
+                cap = None
+
+        if cap is not None:
+            capped_intervals = []
+            for low, high in intervals_for_boot:
+                upper = max_steps if high is None else float(high)
+                upper = min(upper, cap)
+                lower = min(float(low), upper)
+                capped_intervals.append((lower, upper))
+            intervals_for_boot = capped_intervals
+            capped_mid = np.array([(lo + hi) / 2.0 for lo, hi in intervals_for_boot], dtype=float)
+            if capped_mid.size:
+                mid_for_stats = capped_mid
+
+        boot = _bootstrap_median(intervals_for_boot, max_steps)
+        stats[k] = {
+            "mean": float(np.mean(mid_for_stats)),
+            "std": float(np.std(mid_for_stats)),
+            "median": boot["median"],
+            "ci_low": boot["ci_low"],
+            "ci_high": boot["ci_high"],
+            "count": int(mid_for_stats.size),
+        }
     return stats
 
 
@@ -190,7 +302,10 @@ def plot_accuracy_progression(
     targets = sorted(accuracy_stats.keys())
     train_levels = sorted({tl for tgt in targets for tl in accuracy_stats[tgt].keys()})
 
-    for train_k in train_levels:
+    cmap = plt.get_cmap("plasma")
+    color_vals = np.linspace(0, 1, len(train_levels) or 1)
+
+    for color, train_k in zip(cmap(color_vals), train_levels):
         xs: List[int] = []
         ys: List[float] = []
         errs: List[float] = []
@@ -203,7 +318,7 @@ def plot_accuracy_progression(
             errs.append(stats["std"])
         if not xs:
             continue
-        plt.errorbar(xs, ys, yerr=errs, fmt="o-", capsize=3, label=f"train k={train_k}")
+        plt.errorbar(xs, ys, yerr=errs, fmt="o-", capsize=3, label=f"train k={train_k}", color=color)
 
     plt.title(f"{regime}: {metric} vs eval level (mean±std over seeds)")
     plt.xlabel("Eval level k")
@@ -220,13 +335,57 @@ def plot_accuracy_progression(
 def plot_sample_complexity(sc_stats: Dict[int, Dict[str, float]], regime: str, output_dir: str) -> str:
     os.makedirs(output_dir, exist_ok=True)
     ks = sorted(sc_stats.keys())
-    means = [sc_stats[k]["mean"] for k in ks]
-    stds = [sc_stats[k]["std"] for k in ks]
+    medians = [sc_stats[k].get("median", sc_stats[k]["mean"]) for k in ks]
+    ci_lows = [sc_stats[k].get("ci_low", sc_stats[k]["mean"]) for k in ks]
+    ci_highs = [sc_stats[k].get("ci_high", sc_stats[k]["mean"]) for k in ks]
+    lower_err = [m - lo for m, lo in zip(medians, ci_lows)]
+    upper_err = [hi - m for m, hi in zip(medians, ci_highs)]
+
+    vals = np.array(medians, dtype=float)
+    positive_mask = np.isfinite(vals) & (vals > 0)
+    keep_mask = positive_mask.copy()
+    # Drop extreme outliers (Tukey fence) before plotting on log scale.
+    if np.count_nonzero(positive_mask) >= 2:
+        inlier_vals = vals[positive_mask]
+        q1, q3 = np.percentile(inlier_vals, [25, 75])
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        keep_mask &= (vals >= lower) & (vals <= upper)
+    # Drop values that are extreme relative to the median (handles small-sample cases).
+    if np.count_nonzero(positive_mask) >= 1:
+        med = float(np.median(vals[positive_mask]))
+        if med > 0:
+            keep_mask &= vals <= med * 50.0
+    err_arr = np.array(upper_err, dtype=float)
+    finite_err = np.isfinite(err_arr) & (err_arr >= 0)
+    if np.count_nonzero(finite_err) >= 1:
+        err_med = float(np.median(err_arr[finite_err]))
+        if err_med > 0:
+            keep_mask &= err_arr <= err_med * 50.0
+        if np.count_nonzero(positive_mask) >= 1:
+            keep_mask &= err_arr <= np.maximum(vals, err_med) * 50.0
+    # Drop points with CI balloons far above their median.
+    if np.count_nonzero(positive_mask) >= 1:
+        ci_ratio = np.divide(ci_highs, np.maximum(vals, 1e-12))
+        keep_mask &= ci_ratio <= 30.0
+    if not np.any(keep_mask):
+        keep_mask = positive_mask if np.any(positive_mask) else np.ones_like(vals, dtype=bool)
+
+    filtered = [
+        (k, m, lo, hi, le, ue)
+        for idx, (k, m, lo, hi, le, ue) in enumerate(zip(ks, medians, ci_lows, ci_highs, lower_err, upper_err))
+        if keep_mask[idx]
+    ]
+    if filtered:
+        ks, medians, ci_lows, ci_highs, lower_err, upper_err = map(list, zip(*filtered))
+
     plt.figure(figsize=(6.4, 4.0))
-    plt.errorbar(ks, means, yerr=stds, fmt="o-", capsize=4, label="s99_steps")
-    plt.title(f"{regime}: sample complexity (mean±std over seeds)")
+    plt.errorbar(ks, medians, yerr=[lower_err, upper_err], fmt="o-", capsize=4, label="median ± 95% CI")
+    plt.yscale("log")
+    plt.title(f"{regime}: sample complexity (interval-censored bootstrap)")
     plt.xlabel("Train level k")
-    plt.ylabel("Steps to threshold (s99_steps)")
+    plt.ylabel("Steps to threshold")
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     out_path = os.path.join(output_dir, f"sample_complexity_{regime}.png")

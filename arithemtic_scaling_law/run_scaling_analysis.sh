@@ -21,11 +21,19 @@ source "${REPO_DIR}/.venv/bin/activate"
 export PYTHONPATH="${REPO_DIR}:${PYTHONPATH:-}"
 
 MODE="${MODE:-full}"
+TAG="${TAG:-}"
+ACC_TARGET="${ACC_TARGET:-0.95}"
+K_MIN="${K_MIN:-4}"
+K_MAX="${K_MAX:-17}"
 Q_KEEP=${Q_KEEP:-1.0}
 MAX_BLOCK_SIZE=${MAX_BLOCK_SIZE:-1}
 METRIC=${METRIC:-eval_acc_expr}
-REGIME_SLUG="q${Q_KEEP//./}_b${MAX_BLOCK_SIZE}"
-RUN_GROUP=${RUN_GROUP:-"run_${MODE}_${REGIME_SLUG}"}
+REGIME_SLUG="${REGIME_SLUG:-q${Q_KEEP//./}_b${MAX_BLOCK_SIZE}}"
+K_SUFFIX="${K_SUFFIX:-}"
+if [[ "${K_MIN}" != "1" ]]; then
+  K_SUFFIX="kmin${K_MIN}_kmax${K_MAX}"
+fi
+RUN_GROUP=${RUN_GROUP:-"run_${MODE}_${REGIME_SLUG}_t${ACC_TARGET}_${K_SUFFIX}_${TAG}"}
 RESULTS_ROOT="${REPO_DIR}/arithemtic_scaling_law/results"
 
 PLOTS_DIR="${RESULTS_ROOT}/${RUN_GROUP}/plots"

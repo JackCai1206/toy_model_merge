@@ -15,15 +15,14 @@ import random
 import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List
+import shutil
 
 import torch
 from torch.utils.data import ConcatDataset, Dataset, IterableDataset
 from transformers import LlamaForCausalLM, set_seed
 
 from arithemtic_scaling_law.generate_bracketed_cot import MODULUS, generate_dataset, generate_example
-from arithemtic_scaling_law.recursive_sample_complexity import (
-    measure_sample_complexity_with_recursive_rollback,
-)
+from arithemtic_scaling_law.recursive_sample_complexity import train_with_eval_threshold
 from algorithm_composition.utils.collators import CausalLMDataCollator
 from algorithm_composition.utils.tokenizer import SimpleCharTokenizer, build_tokenizer, encode_prompt_with_sep
 from algorithm_composition.utils.training import (
@@ -589,6 +588,8 @@ def train_level(
     tokenizer: SimpleCharTokenizer,
     data_collator: CausalLMDataCollator,
     args: argparse.Namespace,
+    eval_steps: int,
+    eval_delay: int,
     base_checkpoint: str | None = None,
 ) -> Dict[str, object]:
     """Train (or continue training) a model on complexity level k only."""
@@ -601,6 +602,10 @@ def train_level(
         else args.eval_examples_per_level
     )
     level_range = range(args.k_min, k + 1)
+    def _warmup_for(eval_steps: int) -> int:
+        if eval_steps < args.eval_steps:
+            return max(1, int(0.1 * eval_steps))
+        return args.warmup_steps
 
     train_ds = OnlineArithmeticDataset(
         levels=level_range,
@@ -651,27 +656,45 @@ def train_level(
         model_builder = lambda: build_model_from_tokenizer(tokenizer, args.context_length)
         initial_model = None
 
-    trainer, callback, round_history = measure_sample_complexity_with_recursive_rollback(
-        model_builder=model_builder,
-        initial_model=initial_model,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        greedy_eval_fn=eval_fn,
-        output_dir=run_dir,
-        per_device_batch_size=args.per_device_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        grad_accum=args.grad_accum,
-        max_steps=args.max_steps,
-        initial_eval_steps=args.eval_steps,
-        eval_refine_rounds=args.eval_refine_rounds,
-        metric_name="eval_acc_expr",
-        resume_optimizer_state=bool(args.resume_optimizer_state),
-        warmup_steps=args.warmup_steps,
-        rollback_branches=args.rollback_branches,
-        success_threshold=args.acc_target,
-    )
+    trainer = None
+    threshold_steps: List[int] = []
+    callback = None
+    while True:
+        level_warmup = _warmup_for(eval_steps)
+        trainer, callback, threshold_steps = train_with_eval_threshold(
+            model_builder=model_builder,
+            initial_model=initial_model,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+            greedy_eval_fn=eval_fn,
+            output_dir=run_dir,
+            per_device_batch_size=args.per_device_batch_size,
+            per_device_eval_batch_size=args.per_device_eval_batch_size,
+            grad_accum=args.grad_accum,
+            max_steps=args.max_steps,
+            eval_steps=eval_steps,
+            eval_delay=eval_delay,
+            metric_name="eval_acc_expr",
+            warmup_steps=level_warmup,
+            success_threshold=args.acc_target,
+        )
+        first_hit = threshold_steps[0] if threshold_steps else None
+        if first_hit is not None and first_hit <= eval_steps and eval_steps > args.eval_steps_min:
+            new_steps = max(args.eval_steps_min, eval_steps // 2)
+            if new_steps < eval_steps:
+                print(
+                    f"[level k={k}] Early threshold at step {first_hit}; shrinking eval_steps to {new_steps} and rerunning.",
+                    flush=True,
+                )
+                eval_steps = new_steps
+                level_warmup = _warmup_for(eval_steps)
+                if os.path.isdir(run_dir):
+                    shutil.rmtree(run_dir, ignore_errors=True)
+                ensure_dir(run_dir)
+                continue
+        break
 
     # Persist only the latest checkpoint from the best branch.
     latest_steps = list_checkpoint_steps(trainer.args.output_dir)
@@ -692,7 +715,7 @@ def train_level(
     if trainer.args.output_dir != run_dir:
         cleanup_checkpoints(run_dir, keep=0)
 
-    final_best = callback.best_step if callback is not None else None
+    final_best = threshold_steps[0] if threshold_steps else None
     if final_best is None:
         raise RuntimeError(f"Training did not reach threshold for k={k} under regime {regime.slug} before max_steps.")
     s99_steps = final_best or trainer.args.max_steps
@@ -723,8 +746,12 @@ def train_level(
     return {
         "checkpoint": run_dir,
         "k": k,
-        "round_history": round_history,
+        "threshold_steps": threshold_steps,
         "s99_steps": s99_steps,
+        "eval_steps": eval_steps,
+        "eval_delay": eval_delay,
+        "warmup_steps_used": _warmup_for(eval_steps),
+        "max_steps": args.max_steps,
         "metrics": test_metrics,
         "metrics_all_levels": all_levels_metrics,
     }
@@ -761,8 +788,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--per_device_eval_batch_size", type=int, default=32)
     parser.add_argument("--grad_accum", type=int, default=1)
     parser.add_argument("--eval_steps", type=int, default=1000)
-    parser.add_argument("--eval_refine_rounds", type=int, default=4)
-    parser.add_argument("--rollback_branches", type=int, default=1)
+    parser.add_argument(
+        "--eval_steps_min",
+        type=int,
+        default=1,
+        help="Minimum eval interval when adaptively shrinking after early hits.",
+    )
+    parser.add_argument(
+        "--eval_steps_max",
+        type=int,
+        default=None,
+        help="Upper bound on eval interval when adaptively growing after late hits (default: unlimited).",
+    )
+    parser.add_argument(
+        "--eval_jitter_fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of eval_steps to use as max jitter for the first eval offset (per seed/level).",
+    )
     parser.add_argument(
         "--prev_level_mix_fraction",
         type=float,
@@ -774,13 +817,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.8,
         help="Exponential decay factor for weighting earlier levels when mixing in previous-level samples.",
-    )
-    parser.add_argument(
-        "--resume_optimizer_state",
-        type=int,
-        choices=[0, 1],
-        default=1,
-        help="Whether to resume optimizer/scheduler state when continuing from a checkpoint (1=yes, 0=reinit).",
     )
     parser.add_argument("--greedy_eval_batch_size", type=int, default=16)
     parser.add_argument("--greedy_eval_max_new_tokens", type=int, default=64)
@@ -800,7 +836,6 @@ def main() -> None:
         raise ValueError(f"k_min ({args.k_min}) must be less than k_max ({args.k_max}).")
     if args.warmup_steps < 0:
         raise ValueError(f"warmup_steps must be non-negative (got {args.warmup_steps}).")
-    args.resume_optimizer_state = bool(args.resume_optimizer_state)
     set_seed(args.seed)
 
     regime = Regime(args.q_keep, args.max_block_size)
@@ -815,19 +850,49 @@ def main() -> None:
     base_checkpoint: str | None = None
     total_levels = args.k_max - args.k_min
 
+    current_eval_steps = max(args.eval_steps_min, args.eval_steps)
+    eval_steps_max = args.eval_steps_max if args.eval_steps_max is None or args.eval_steps_max > 0 else None
+
     for idx, k in enumerate(range(args.k_min, args.k_max), start=1):
         print(
             f"=== Training level k={k} ({idx}/{total_levels}) | regime={regime.slug} | run_group={run_group} | run_name={run_name} ===",
             flush=True,
         )
-        record = train_level(
-            k=k,
-            regime=regime,
-            tokenizer=tokenizer,
-            data_collator=data_collator,
-            args=args,
-            base_checkpoint=base_checkpoint,
-        )
+        rng = random.Random(args.seed * 7919 + k)
+        level_eval_steps = current_eval_steps
+        attempt = 0
+        first_hit: int | None = None
+        while True:
+            jitter_max = int(level_eval_steps * max(0.0, min(1.0, float(args.eval_jitter_fraction))))
+            eval_delay = rng.randint(0, max(0, jitter_max)) if jitter_max > 0 else 0
+            attempt += 1
+            record = train_level(
+                k=k,
+                regime=regime,
+                tokenizer=tokenizer,
+                data_collator=data_collator,
+                args=args,
+                eval_steps=level_eval_steps,
+                eval_delay=eval_delay,
+                base_checkpoint=base_checkpoint,
+            )
+            threshold_steps = record.get("threshold_steps") or []
+            first_hit = threshold_steps[0] if threshold_steps else None
+            if (
+                first_hit is not None
+                and first_hit <= level_eval_steps
+                and level_eval_steps > args.eval_steps_min
+            ):
+                new_steps = max(args.eval_steps_min, level_eval_steps // 2)
+                if new_steps < level_eval_steps:
+                    print(
+                        f"[level k={k}] Early threshold at step {first_hit}; shrinking eval_steps to {new_steps} and rerunning (attempt {attempt+1}).",
+                        flush=True,
+                    )
+                    level_eval_steps = new_steps
+                    continue
+            break
+
         base_checkpoint = record["checkpoint"]
         ensure_dir(args.results_dir)
         record.update(
@@ -858,6 +923,19 @@ def main() -> None:
             f"eval_exact_full={_fmt(metrics.get('eval_exact_full'))}",
             flush=True,
         )
+
+        if first_hit is not None and first_hit > 3 * level_eval_steps:
+            grown = int(level_eval_steps * 2)
+            if eval_steps_max is not None:
+                grown = min(grown, eval_steps_max)
+            if grown != level_eval_steps:
+                print(
+                    f"[level k={k}] Late threshold at step {first_hit}; increasing eval_steps to {grown} for subsequent levels.",
+                    flush=True,
+                )
+            current_eval_steps = grown
+        else:
+            current_eval_steps = level_eval_steps
 
 
 if __name__ == "__main__":

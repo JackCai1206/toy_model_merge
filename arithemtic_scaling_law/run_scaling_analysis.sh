@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Aggregate results across all seeds in a run group. Run this after array jobs finish:
-#   MODE=full RUN_GROUP=... Q_KEEP=... MAX_BLOCK_SIZE=... sbatch arithemtic_scaling_law/run_scaling_analysis.sh
+#   MODE=full RUN_GROUP=... Q_KEEP=... MAX_STEPS_PER_BLOCK=... sbatch arithemtic_scaling_law/run_scaling_analysis.sh
 
 #SBATCH --job-name=arith-scale-analyze
 #SBATCH --nodes=1
@@ -21,18 +21,16 @@ source "${REPO_DIR}/.venv/bin/activate"
 export PYTHONPATH="${REPO_DIR}:${PYTHONPATH:-}"
 
 MODE="${MODE:-full}"
-TAG="${TAG:-}"
+TAG="${TAG:-v2}"
 ACC_TARGET="${ACC_TARGET:-0.95}"
-K_MIN="${K_MIN:-4}"
-K_MAX="${K_MAX:-17}"
-Q_KEEP=${Q_KEEP:-1.0}
-MAX_BLOCK_SIZE=${MAX_BLOCK_SIZE:-1}
+K_MIN="${K_MIN:-1}"
+K_MAX="${K_MAX:-33}"
+Q_KEEP=${Q_KEEP:-0.8}
+MAX_STEPS_PER_BLOCK=${MAX_STEPS_PER_BLOCK:-2}
 METRIC=${METRIC:-eval_acc_expr}
-REGIME_SLUG="${REGIME_SLUG:-q${Q_KEEP//./}_b${MAX_BLOCK_SIZE}}"
+REGIME_SLUG="${REGIME_SLUG:-q${Q_KEEP//./}_b${MAX_STEPS_PER_BLOCK}}"
 K_SUFFIX="${K_SUFFIX:-}"
-if [[ "${K_MIN}" != "1" ]]; then
-  K_SUFFIX="kmin${K_MIN}_kmax${K_MAX}"
-fi
+K_SUFFIX="kmin${K_MIN}_kmax${K_MAX}"
 RUN_GROUP=${RUN_GROUP:-"run_${MODE}_${REGIME_SLUG}_t${ACC_TARGET}_${K_SUFFIX}_${TAG}"}
 RESULTS_ROOT="${REPO_DIR}/arithemtic_scaling_law/results"
 

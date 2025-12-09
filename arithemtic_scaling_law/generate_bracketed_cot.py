@@ -15,7 +15,7 @@ import json
 import os
 import random
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Sequence, Tuple
 
 
 MODULUS = 100
@@ -68,7 +68,7 @@ def generate_random_tree(num_ops: int, rng: random.Random, max_val: int = 99, ea
     return Node(op=op, left=left, right=right)
 
 
-def eval_and_build_atomic_steps(node: Node, steps: List[Dict[str, int | str]]) -> Tuple[int, str]:
+def eval_and_build_atomic_steps(node: Node, steps: List[Dict[str, Any]]) -> Tuple[int, str]:
     """Evaluate the tree modulo MODULUS and append atomic steps in post-order."""
 
     if node.op is None:
@@ -103,35 +103,36 @@ def eval_and_build_atomic_steps(node: Node, steps: List[Dict[str, int | str]]) -
             "op": node.op,
             "left_value": lv,
             "right_value": rv,
+            "node": node,
         }
     )
     return val, expr
 
 
 def collapse_steps_with_cap(
-    atomic_steps: Sequence[Dict[str, int | str]],
+    atomic_steps: Sequence[Dict[str, Any]],
     rng: random.Random,
     q_keep: float = 0.6,
-    max_block_size: int = 3,
-) -> Tuple[List[str], List[List[Dict[str, int]]]]:
+    max_steps_per_block: int = 3,
+) -> Tuple[List[str], List[List[Dict[str, Any]]]]:
     """Collapse consecutive atomic steps into capped blocks and render visible CoT."""
 
     if not 0.0 < q_keep <= 1.0:
         raise ValueError("q_keep must be in (0, 1].")
-    if max_block_size < 1:
-        raise ValueError("max_block_size must be >= 1.")
+    if max_steps_per_block < 1:
+        raise ValueError("max_steps_per_block must be >= 1.")
 
     if not atomic_steps:
         return [], []
 
-    blocks: List[List[Dict[str, int]]] = []
-    current: List[Dict[str, int]] = []
+    blocks: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
 
     for step in atomic_steps:
         start_new = False
         if not current:
             start_new = True
-        elif len(current) >= max_block_size:
+        elif len(current) >= max_steps_per_block:
             start_new = True
         else:
             if rng.random() < q_keep:
@@ -147,16 +148,46 @@ def collapse_steps_with_cap(
     if current:
         blocks.append(current)
 
-    visible: List[str] = []
-    for idx, block in enumerate(blocks, start=1):
-        root = block[-1]  # last step is the root of the block
-        visible.append(f"Step {idx}: Compute {root['expr']} = {root['value']} (mod {MODULUS}).")
+    root_node: Node | None = atomic_steps[-1].get("node") if atomic_steps else None
+    if root_node is None:
+        return [], blocks
 
-    return visible, blocks
+    collapsed_ids: set[int] = set()
+    states: List[str] = [render_expression_with_collapses(root_node, collapsed_ids)]
+    for block in blocks:
+        for step in block:
+            node = step.get("node")
+            if isinstance(node, Node):
+                collapsed_ids.add(id(node))
+        states.append(render_expression_with_collapses(root_node, collapsed_ids))
+
+    return states, blocks
 
 
-def build_atomic_cot(atomic_steps: Sequence[Dict[str, int | str]]) -> List[str]:
-    return [f"Compute {s['expr']} = {s['value']} (mod {MODULUS})." for s in atomic_steps]
+def render_expression_with_collapses(node: Node | None, collapsed_ids: set[int]) -> str:
+    """Render the full expression after collapsing the nodes whose ids are in `collapsed_ids`."""
+
+    if node is None:
+        return ""
+
+    node_id = id(node)
+    if node_id in collapsed_ids and node.value is not None:
+        return str(int(node.value) % MODULUS)
+
+    if node.op is None:
+        if node.expr is not None:
+            return node.expr.replace(" ", "")
+        if node.val is not None:
+            return str(node.val)
+        return "0"
+
+    left_rendered = render_expression_with_collapses(node.left, collapsed_ids)
+    right_rendered = render_expression_with_collapses(node.right, collapsed_ids)
+    return f"({left_rendered}{node.op}{right_rendered})"
+
+
+def build_atomic_cot(atomic_steps: Sequence[Dict[str, Any]]) -> List[str]:
+    return [f"{str(s['expr']).replace(' ', '')}={int(s['value']) % MODULUS}" for s in atomic_steps]
 
 
 def evaluate_expr_mod(expr: str, modulus: int = MODULUS) -> int:
@@ -187,21 +218,19 @@ def evaluate_expr_mod(expr: str, modulus: int = MODULUS) -> int:
 def parse_visible_step(step: str) -> Tuple[str, int]:
     """Extract (expr, value) from a visible CoT sentence."""
 
-    prefix = "Compute "
-    if prefix not in step:
-        raise ValueError(f"Step missing 'Compute' prefix: {step}")
+    body = step.strip().rstrip(".")
+    if "=" not in body:
+        raise ValueError(f"Step missing '=': {step}")
+    expr_part, value_part = body.rsplit("=", maxsplit=1)
+    expr = expr_part.strip()
     try:
-        after_prefix = step.split(prefix, maxsplit=1)[1]
-        expr_part, value_part = after_prefix.rsplit(" = ", maxsplit=1)
-        value_str = value_part.split("(mod", maxsplit=1)[0].strip()
-        value = int(value_str)
-        expr = expr_part.strip()
-    except Exception as exc:  # pragma: no cover - defensive
-        raise ValueError(f"Failed to parse step: {step}") from exc
+        value = int(value_part.strip())
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise ValueError(f"Failed to parse value in step: {step}") from exc
     return expr, value
 
 
-def sanity_check_example(example: Dict, max_block_size: int, modulus: int = MODULUS) -> None:
+def sanity_check_example(example: Dict, max_steps_per_block: int, modulus: int = MODULUS) -> None:
     """Run basic consistency checks on a generated example."""
 
     expr = example["expression"]
@@ -213,17 +242,18 @@ def sanity_check_example(example: Dict, max_block_size: int, modulus: int = MODU
     if evaluate_expr_mod(expr, modulus) != answer:
         raise ValueError("Expression evaluation mismatch.")
 
-    # Verify each visible step's numeric value.
-    for step in visible_cot:
-        step_expr, step_val = parse_visible_step(step)
-        if evaluate_expr_mod(step_expr, modulus) != step_val:
-            raise ValueError(f"Visible step mismatch: {step}")
+    # Verify each visible state still evaluates to the final answer.
+    if not visible_cot:
+        raise ValueError("Visible CoT is empty.")
+    for state in visible_cot:
+        if evaluate_expr_mod(state, modulus) != answer:
+            raise ValueError(f"Visible state mismatch: {state}")
 
     # Verify block size cap (if provided).
     if block_sizes:
         for size in block_sizes:
-            if size < 1 or size > max_block_size:
-                raise ValueError(f"Block size {size} violates cap {max_block_size}.")
+            if size < 1 or size > max_steps_per_block:
+                raise ValueError(f"Block size {size} violates cap {max_steps_per_block}.")
 
     # Atomic steps length should align with complexity.
     if example["num_atomic_steps"] != example["complexity_k"]:
@@ -231,7 +261,7 @@ def sanity_check_example(example: Dict, max_block_size: int, modulus: int = MODU
 
     # Atomic CoT lines should evaluate correctly.
     for line in atomic_cot:
-        sub_expr, sub_val = parse_visible_step(f"Step 0: {line}")
+        sub_expr, sub_val = parse_visible_step(line)
         if evaluate_expr_mod(sub_expr, modulus) != sub_val:
             raise ValueError(f"Atomic CoT mismatch: {line}")
 
@@ -240,7 +270,7 @@ def generate_example(
     k: int,
     rng: random.Random,
     q_keep: float,
-    max_block_size: int,
+    max_steps_per_block: int,
     max_val: int = 99,
     easy_multiplication: bool = True,
 ) -> Dict:
@@ -254,7 +284,7 @@ def generate_example(
         atomic_steps=atomic_steps,
         rng=rng,
         q_keep=q_keep,
-        max_block_size=max_block_size,
+        max_steps_per_block=max_steps_per_block,
     )
 
     atomic_cot = build_atomic_cot(atomic_steps)
@@ -270,7 +300,7 @@ def generate_example(
         "atomic_cot": atomic_cot,
         "block_sizes": block_sizes,
         "q_keep": q_keep,
-        "max_block_size": max_block_size,
+        "max_steps_per_block": max_steps_per_block,
         "max_val": max_val,
     }
 
@@ -281,7 +311,7 @@ def generate_dataset(
     k_max: int,
     examples_per_k: int,
     q_keep: float,
-    max_block_size: int,
+    max_steps_per_block: int,
     seed: int,
     output_path: str,
     max_val: int = 99,
@@ -301,12 +331,12 @@ def generate_dataset(
                     k=k,
                     rng=rng,
                     q_keep=q_keep,
-                    max_block_size=max_block_size,
+                    max_steps_per_block=max_steps_per_block,
                     max_val=max_val,
                     easy_multiplication=easy_multiplication,
                 )
                 if run_sanity_checks:
-                    sanity_check_example(example, max_block_size)
+                    sanity_check_example(example, max_steps_per_block)
                 handle.write(json.dumps(example) + "\n")
                 total += 1
                 if progress_every and total % progress_every == 0:
@@ -319,7 +349,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k_max", type=int, default=6, help="Maximum complexity k.")
     parser.add_argument("--examples_per_k", type=int, default=1000, help="Examples per complexity level.")
     parser.add_argument("--q_keep", type=float, default=0.6, help="Probability of starting a new CoT block.")
-    parser.add_argument("--max_block_size", type=int, default=3, help="Maximum atomic steps per visible block.")
+    parser.add_argument(
+        "--max_steps_per_block",
+        type=int,
+        default=3,
+        help="Maximum atomic steps collapsed into a single visible substitution chain.",
+    )
     parser.add_argument("--max_val", type=int, default=99, help="Maximum leaf integer value.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--output", type=str, default="arithmetic_cot_mod100.jsonl", help="Output JSONL path.")
@@ -335,7 +370,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         k_max=args.k_max,
         examples_per_k=args.examples_per_k,
         q_keep=args.q_keep,
-        max_block_size=args.max_block_size,
+    max_steps_per_block=args.max_steps_per_block,
         seed=args.seed,
         output_path=args.output,
         max_val=args.max_val,

@@ -10,7 +10,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=64G
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=pli-c
 #SBATCH --output=arithemtic_scaling_law/logs/scale_%a.out
@@ -27,10 +27,10 @@ source "${REPO_DIR}/.venv/bin/activate"
 export PYTHONPATH="${REPO_DIR}:${PYTHONPATH:-}"
 
 # Keep logs clean.
-# export TQDM_DISABLE=1
-# export DISABLE_PROGRESS_BAR=1
-# export DATASETS_DISABLE_PROGRESS_BAR=1
-# export HF_HUB_DISABLE_PROGRESS_BARS=1
+export TQDM_DISABLE=1
+export DISABLE_PROGRESS_BAR=1
+export DATASETS_DISABLE_PROGRESS_BAR=1
+export HF_HUB_DISABLE_PROGRESS_BARS=1
 
 TAG="${TAG:-}"
 MODE="${MODE:-full}"
@@ -54,7 +54,7 @@ FINAL_EVAL_EXAMPLES_PER_LEVEL=${FINAL_EVAL_EXAMPLES_PER_LEVEL:-500}
 DATA_DIR="${REPO_DIR}/arithemtic_scaling_law/data"
 ARTIFACTS_ROOT="${REPO_DIR}/arithemtic_scaling_law/artifacts"
 RESULTS_ROOT="${REPO_DIR}/arithemtic_scaling_law/results"
-CONTEXT_LENGTH=${CONTEXT_LENGTH:-1024}
+CONTEXT_LENGTH=${CONTEXT_LENGTH:-2048}
 PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-128}
 PER_DEVICE_EVAL_BATCH_SIZE=${PER_DEVICE_EVAL_BATCH_SIZE:-1024}
 GRAD_ACCUM=${GRAD_ACCUM:-1}
@@ -71,14 +71,14 @@ WARMUP_STEPS=${WARMUP_STEPS:-100}
 ACC_TARGET=${ACC_TARGET:-0.90}
 FINAL_EVAL_STOP_THRESHOLD=${FINAL_EVAL_STOP_THRESHOLD:-}
 Q_KEEP=${Q_KEEP:-1.0}
-MAX_BLOCK_SIZE=${MAX_BLOCK_SIZE:-1}
-REGIME_SLUG="${REGIME_SLUG:-q${Q_KEEP//./}_b${MAX_BLOCK_SIZE}}"
+MAX_STEPS_PER_BLOCK=${MAX_STEPS_PER_BLOCK:-1}
+REGIME_SLUG="${REGIME_SLUG:-q${Q_KEEP//./}_b${MAX_STEPS_PER_BLOCK}}"
 K_SUFFIX=""
 if [[ "${K_MIN}" != "1" ]]; then
   K_SUFFIX="kmin${K_MIN}_kmax${K_MAX}"
 fi
 RUN_GROUP=${RUN_GROUP:-"run_${MODE}_${REGIME_SLUG}_t${ACC_TARGET}_${K_SUFFIX}_${TAG}"}
-## Override Q_KEEP/MAX_BLOCK_SIZE to control the dataset regime.
+## Override Q_KEEP/MAX_STEPS_PER_BLOCK to control the dataset regime.
 
 if [[ "${MODE}" == "sanity" ]]; then
   # Smaller settings for a fast sanity sweep.
@@ -131,7 +131,7 @@ for SEED in ${SEEDS}; do
   )
 
   CMD+=(--q_keep "${Q_KEEP}")
-  CMD+=(--max_block_size "${MAX_BLOCK_SIZE}")
+  CMD+=(--max_steps_per_block "${MAX_STEPS_PER_BLOCK}")
 
   if [[ -n "${FINAL_EVAL_STOP_THRESHOLD}" ]]; then
     CMD+=(--final_eval_stop_threshold "${FINAL_EVAL_STOP_THRESHOLD}")
@@ -150,4 +150,4 @@ for SEED in ${SEEDS}; do
 done
 
 # Run aggregation separately after all array jobs complete:
-#   MODE=full RUN_GROUP=... Q_KEEP=... MAX_BLOCK_SIZE=... sbatch arithemtic_scaling_law/run_scaling_analysis.sh
+#   MODE=full RUN_GROUP=... Q_KEEP=... MAX_STEPS_PER_BLOCK=... sbatch arithemtic_scaling_law/run_scaling_analysis.sh

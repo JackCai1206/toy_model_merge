@@ -14,7 +14,7 @@ import os
 import random
 import re
 from dataclasses import dataclass
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List
 import shutil
 
 import torch
@@ -93,10 +93,18 @@ def _parse_answer(gen_ids: List[int], tokenizer: SimpleCharTokenizer) -> int | N
             return int("".join(digits)) % MODULUS
 
     gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    eq_matches = re.findall(r"=\s*(-?\d+)", gen_text)
+    if eq_matches:
+        return int(eq_matches[-1]) % MODULUS
+
     match = re.findall(r"-?\d+", gen_text)
     if not match:
         return None
     return int(match[-1]) % MODULUS
+
+
+class SampleTooLongError(RuntimeError):
+    """Raised when we cannot fit a sampled prompt/target within the context window."""
 
 
 class ArithmeticCoTDataset(Dataset):
@@ -134,17 +142,19 @@ class ArithmeticCoTDataset(Dataset):
         steps = record.get("visible_cot", [])
 
         def _clean_step(step: str) -> str:
-            # Strip "Step X:" prefix and all whitespace to minimize token count.
             step_no_prefix = re.sub(r"(?i)step\s*\d+:\s*", "", step)
             step_no_compute = re.sub(r"(?i)compute\s*", "", step_no_prefix)
             step_no_mod = re.sub(r"(?i)\(mod\s*\d+\)", "", step_no_compute)
             step_compact = re.sub(r"\s+", "", step_no_mod)
             return step_compact.strip(".")
 
-        cot_text = "|".join(_clean_step(step).upper() for step in steps if step)
-        cot_part = f"C{cot_text}" if cot_text else "C"
-        prompt = f"E{expr}".upper()
-        target = f"{cot_part}|A{record['answer']}".upper()
+        cleaned_steps = [_clean_step(step) for step in steps if step]
+        if cleaned_steps:
+            target = "=".join(cleaned_steps)
+        else:
+            target = str(int(record["answer"]) % MODULUS)
+
+        prompt = f"{expr}="
         return {
             "prompt": prompt,
             "target": target,
@@ -192,6 +202,7 @@ class OnlineArithmeticDataset(IterableDataset):
         focus_level: int | None = None,
         mix_prev_fraction: float = 0.0,
         mix_prev_decay: float = 0.8,
+        max_resample_attempts: int = 1000,
     ) -> None:
         level_list = sorted(set(levels))
         if focus_level is not None and focus_level not in level_list:
@@ -214,6 +225,7 @@ class OnlineArithmeticDataset(IterableDataset):
         self._prev_level_weights = [
             self.mix_prev_decay ** max(1, self.focus_level - lvl) for lvl in self._prev_levels
         ] if self._prev_levels else []
+        self.max_resample_attempts = max(1, int(max_resample_attempts))
 
     def __iter__(self):
         from torch.utils.data import get_worker_info
@@ -248,27 +260,22 @@ class OnlineArithmeticDataset(IterableDataset):
     def _sample_example(
         self, rng: random.Random
     ) -> tuple[Dict[str, torch.Tensor], Dict[str, str | int]]:
-        while True:
+        attempts = 0
+        last_error: Exception | None = None
+        last_level: int | None = None
+        while attempts < self.max_resample_attempts:
+            attempts += 1
             k = self._sample_level(rng)
             example = generate_example(
                 k=k,
                 rng=rng,
                 q_keep=self.regime.q_keep,
-                max_block_size=self.regime.max_block_size,
+                max_steps_per_block=self.regime.max_steps_per_block,
             )
             expr = example["expression"].replace(" ", "")
-
-            def _clean_step(step: str) -> str:
-                step_no_prefix = re.sub(r"(?i)step\\s*\\d+:\\s*", "", step)
-                step_no_compute = re.sub(r"(?i)compute\\s*", "", step_no_prefix)
-                step_no_mod = re.sub(r"(?i)\\(mod\\s*\\d+\\)", "", step_no_compute)
-                step_compact = re.sub(r"\\s+", "", step_no_mod)
-                return step_compact.strip(".")
-
-            cot_text = "|".join(_clean_step(step).upper() for step in example["visible_cot"] if step)
-            cot_part = f"C{cot_text}" if cot_text else "C"
-            prompt = f"E{expr}".upper()
-            target = f"{cot_part}|A{example['answer']}".upper()
+            prompt = f"{expr}="
+            steps = [step.replace(" ", "") for step in example["visible_cot"] if step]
+            target = "=".join(steps) if steps else str(int(example["answer"]) % MODULUS)
             try:
                 encoded = _encode_prompt_and_target(
                     tokenizer=self.tokenizer,
@@ -276,8 +283,9 @@ class OnlineArithmeticDataset(IterableDataset):
                     target=target,
                     max_length=self.max_length,
                 )
-            except ValueError:
-                # Occasionally a sampled prompt may exceed the desired max_length; resample.
+            except ValueError as exc:
+                last_error = exc
+                last_level = k
                 continue
 
             encoded["answer"] = torch.tensor(int(example["answer"]) % MODULUS, dtype=torch.long)
@@ -290,6 +298,12 @@ class OnlineArithmeticDataset(IterableDataset):
             }
             return encoded, text_fields
 
+        level_info = last_level if last_level is not None else (self.focus_level or -1)
+        raise SampleTooLongError(
+            f"Failed to sample an example for k={level_info} within max_length={self.max_length} "
+            f"after {self.max_resample_attempts} attempts. Last error: {last_error}"
+        )
+
 
 def greedy_eval_arithmetic(
     model,
@@ -300,8 +314,14 @@ def greedy_eval_arithmetic(
     match_target_length: bool = False,
     per_level_breakdown: bool = False,
     include_counts: bool = False,
+    sample_print_limit: int = 0,
+    sample_print_context: str | None = None,
 ) -> Dict[str, float]:
-    """Greedy decoding evaluation returning expression-level accuracy."""
+    """Greedy decoding evaluation returning expression-level accuracy.
+
+    When `sample_print_limit` > 0, prints up to that many prompt/target/prediction triples for
+    quick manual inspection each time this eval function is called.
+    """
 
     device = next(model.parameters()).device
     model.eval()
@@ -312,32 +332,29 @@ def greedy_eval_arithmetic(
     exact_matches = 0
     per_level_total: Dict[int, int] = {}
     per_level_correct: Dict[int, int] = {}
-
+    sample_limit = max(0, int(sample_print_limit or 0))
+    sample_logs: List[Dict[str, Any]] = []
     with torch.no_grad():
         for start in range(0, total, batch_size):
             end = min(total, start + batch_size)
             batch_items = [dataset.get_prompt_and_target(idx) for idx in range(start, end)]
+            if not batch_items:
+                continue
             prompts = [encode_prompt_with_sep(tokenizer, item["prompt"]) for item in batch_items]
             prompt_lens = [len(p) for p in prompts]
             max_prompt = max(prompt_lens)
             batch = len(prompts)
-
-            input_ids = torch.full(
-                (batch, max_prompt), tokenizer.pad_token_id, dtype=torch.long, device=device
-            )
+            input_ids = torch.full((batch, max_prompt), tokenizer.pad_token_id, dtype=torch.long, device=device)
             attention_mask = torch.zeros_like(input_ids)
             for row, ids in enumerate(prompts):
                 length = len(ids)
-                # Left-pad to avoid right-padding warnings for decoder-only generation.
                 offset = max_prompt - length
                 input_ids[row, offset:] = torch.tensor(ids, dtype=torch.long, device=device)
                 attention_mask[row, offset:] = 1
 
             gen_max = max_new_tokens
             if match_target_length:
-                target_lengths = [
-                    len(tokenizer.encode(item["target"], add_special_tokens=False)) for item in batch_items
-                ]
+                target_lengths = [len(tokenizer.encode(item["target"], add_special_tokens=False)) for item in batch_items]
                 gen_max = max(gen_max, max(target_lengths, default=0))
 
             generated = model.generate(
@@ -350,11 +367,10 @@ def greedy_eval_arithmetic(
 
             input_length = input_ids.shape[1]
             for row, item in enumerate(batch_items):
-                # Generation output includes the (left-padded) prompt; strip the full input length,
-                # not just the raw prompt tokens, to avoid leaking prompt tokens into eval parsing.
                 gen_ids = generated[row].tolist()[input_length:]
                 gen_ids = _strip_after_eos(gen_ids, tokenizer.eos_token_id)
                 pred_answer = _parse_answer(gen_ids, tokenizer)
+                generated_text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
                 if pred_answer is not None and pred_answer == item["answer"]:
                     correct += 1
                 target_ids = tokenizer.encode(item["target"], add_special_tokens=False)
@@ -364,6 +380,19 @@ def greedy_eval_arithmetic(
                         token_hits += 1
                 if gen_ids == target_ids:
                     exact_matches += 1
+                if sample_limit and len(sample_logs) < sample_limit:
+                    sample_logs.append(
+                        {
+                            "prompt": item.get("prompt"),
+                            "target": item.get("target"),
+                            "generated": generated_text,
+                            "pred_answer": pred_answer,
+                            "target_answer": item.get("answer"),
+                            "exact_match": gen_ids == target_ids,
+                            "expr_correct": pred_answer is not None and pred_answer == item["answer"],
+                            "complexity_k": item.get("complexity_k"),
+                        }
+                    )
                 if per_level_breakdown:
                     level = int(item.get("complexity_k", -1)) if isinstance(item, dict) else -1
                     per_level_total[level] = per_level_total.get(level, 0) + 1
@@ -384,6 +413,26 @@ def greedy_eval_arithmetic(
         metrics["eval_count_token_hits"] = token_hits
         metrics["eval_count_token_total"] = token_total
         metrics["eval_count_exact_matches"] = exact_matches
+    if sample_logs:
+        context = sample_print_context or "eval"
+        print(
+            f"[{context}] showing {len(sample_logs)} sample(s) (limit={sample_limit})",
+            flush=True,
+        )
+        for idx, sample in enumerate(sample_logs, start=1):
+            print(
+                f"[{context} sample {idx}] k={sample.get('complexity_k', '?')} expr_correct={sample['expr_correct']} exact={sample['exact_match']}",
+                flush=True,
+            )
+            print(f"prompt: {sample['prompt']}", flush=True)
+            print(f"target:\n{sample['target']}", flush=True)
+            print(f"generated:\n{sample['generated']}", flush=True)
+            print(
+                f"parsed_answer={sample['pred_answer']} target_answer={sample['target_answer']}",
+                flush=True,
+            )
+            print("-" * 60, flush=True)
+
     return metrics
 
 
@@ -393,6 +442,8 @@ def make_eval_fn(
     max_new_tokens: int,
     batch_size: int,
     match_target_length: bool,
+    sample_print_limit: int = 0,
+    sample_print_context: str | None = None,
 ):
     return lambda model: greedy_eval_arithmetic(
         model=model,
@@ -401,6 +452,8 @@ def make_eval_fn(
         max_new_tokens=max_new_tokens,
         batch_size=batch_size,
         match_target_length=match_target_length,
+        sample_print_limit=sample_print_limit,
+        sample_print_context=sample_print_context,
     )
 
 
@@ -427,6 +480,7 @@ def evaluate_levels_with_early_stop(
     seed_base: int = 0,
     show_progress: bool = False,
     stop_threshold: float | None = None,
+    sample_print_limit: int = 0,
 ) -> Dict[str, float]:
     """Run greedy eval level-by-level and optionally stop early once accuracy dips to/below the threshold."""
 
@@ -451,15 +505,25 @@ def evaluate_levels_with_early_stop(
             regime=regime,
             seed=level_seed,
         )
-        level_metrics = greedy_eval_arithmetic(
-            model=model,
-            tokenizer=tokenizer,
-            dataset=level_ds,
-            max_new_tokens=max_new_tokens,
-            batch_size=batch_size,
-            match_target_length=match_target_length,
-            include_counts=True,
-        )
+        try:
+            level_metrics = greedy_eval_arithmetic(
+                model=model,
+                tokenizer=tokenizer,
+                dataset=level_ds,
+                max_new_tokens=max_new_tokens,
+                batch_size=batch_size,
+                match_target_length=match_target_length,
+                include_counts=True,
+                sample_print_limit=sample_print_limit,
+                sample_print_context=f"final_eval_k{level}",
+            )
+        except SampleTooLongError as exc:
+            print(
+                f"[final eval] stopping at k={level} because samples exceed context length: {exc}",
+                flush=True,
+            )
+            break
+
         levels_evaluated.append(level)
         level_count = len(level_ds)
         metrics[f"eval_acc_expr_k{level}"] = level_metrics["eval_acc_expr"]
@@ -486,28 +550,22 @@ def evaluate_levels_with_early_stop(
 
     metrics["eval_levels_evaluated"] = len(levels_evaluated)
     metrics["eval_acc_expr"] = aggregate_correct / max(aggregate_examples, 1)
-    metrics["eval_exact_full"] = aggregate_exact / max(aggregate_examples, 1)
     metrics["eval_token_accuracy"] = aggregate_token_hits / max(aggregate_token_total, 1)
     return metrics
-
-
-# -----------------------------
-# Experiment driver
-# -----------------------------
 
 
 @dataclass(frozen=True)
 class Regime:
     q_keep: float
-    max_block_size: int
+    max_steps_per_block: int
 
     @property
     def slug(self) -> str:
         q_str = str(self.q_keep).replace(".", "")
-        return f"q{q_str}_b{self.max_block_size}"
+        return f"q{q_str}_b{self.max_steps_per_block}"
 
     def as_dict(self) -> Dict[str, float | int]:
-        return {"q_keep": self.q_keep, "max_block_size": self.max_block_size}
+        return {"q_keep": self.q_keep, "max_steps_per_block": self.max_steps_per_block}
 
 
 def maybe_generate_split(
@@ -529,7 +587,7 @@ def maybe_generate_split(
         k_max=k_max,
         examples_per_k=examples_per_k,
         q_keep=regime.q_keep,
-        max_block_size=regime.max_block_size,
+        max_steps_per_block=regime.max_steps_per_block,
         seed=seed,
         output_path=path,
     )
@@ -647,6 +705,8 @@ def train_level(
         max_new_tokens=args.greedy_eval_max_new_tokens,
         batch_size=args.greedy_eval_batch_size,
         match_target_length=args.greedy_eval_match_target_length,
+        sample_print_limit=args.eval_print_examples,
+        sample_print_context=f"train_eval_k{k}",
     )
 
     if base_checkpoint:
@@ -727,6 +787,8 @@ def train_level(
         max_new_tokens=args.greedy_eval_max_new_tokens,
         batch_size=args.greedy_eval_batch_size,
         match_target_length=args.greedy_eval_match_target_length,
+        sample_print_limit=args.eval_print_examples,
+        sample_print_context=f"test_k{k}",
     )
     all_levels_metrics = evaluate_levels_with_early_stop(
         model=eval_model,
@@ -741,6 +803,7 @@ def train_level(
         seed_base=args.seed + 19 * k,
         show_progress=True,
         stop_threshold=args.final_eval_stop_threshold,
+        sample_print_limit=args.eval_print_examples,
     )
 
     return {
@@ -764,7 +827,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_name", type=str, default=None, help="Human-friendly run label (e.g., seed_123).")
     parser.add_argument("--run_group", type=str, default=None, help="Group folder to cluster seeds/runs.")
     parser.add_argument("--q_keep", type=float, default=1.0, help="q_keep value for dataset corruption.")
-    parser.add_argument("--max_block_size", type=int, default=1, help="max_block_size for dataset generation.")
+    parser.add_argument(
+        "--max_steps_per_block",
+        type=int,
+        default=1,
+        help="Upper bound on atomic steps collapsed into a single visible calculation.",
+    )
     parser.add_argument("--train_examples_per_level", type=int, default=20000)
     parser.add_argument("--eval_examples_per_level", type=int, default=2000)
     parser.add_argument(
@@ -821,6 +889,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--greedy_eval_batch_size", type=int, default=16)
     parser.add_argument("--greedy_eval_max_new_tokens", type=int, default=64)
     parser.add_argument("--greedy_eval_match_target_length", action="store_true")
+    parser.add_argument(
+        "--eval_print_examples",
+        type=int,
+        default=3,
+        help="Number of prompt/target/prediction triples to print each time an eval runs (set 0 to disable).",
+    )
     parser.add_argument("--max_steps", type=int, default=200000, help="Upper bound on steps per level.")
     parser.add_argument("--warmup_steps", type=int, default=600, help="Optimizer warmup steps.")
     parser.add_argument("--acc_target", type=float, default=0.9)
@@ -838,7 +912,7 @@ def main() -> None:
         raise ValueError(f"warmup_steps must be non-negative (got {args.warmup_steps}).")
     set_seed(args.seed)
 
-    regime = Regime(args.q_keep, args.max_block_size)
+    regime = Regime(args.q_keep, args.max_steps_per_block)
     run_name = args.run_name or f"seed_{args.seed}"
     run_group = args.run_group or f"run_{regime.slug}"
     if args.run_group is None and args.k_min != 1:

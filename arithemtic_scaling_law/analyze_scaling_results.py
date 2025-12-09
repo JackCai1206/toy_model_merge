@@ -70,7 +70,7 @@ def load_results(results_dir: str, metric: str) -> List[Dict]:
 
 def regime_slug(regime: Dict) -> str:
     q = regime.get("q_keep", "q?")
-    block = regime.get("max_block_size", "?")
+    block = regime.get("max_steps_per_block", regime.get("max_block_size", "?"))
     q_str = str(q).replace(".", "")
     return f"q{q_str}_b{block}"
 

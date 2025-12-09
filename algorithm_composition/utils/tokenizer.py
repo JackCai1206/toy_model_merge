@@ -8,7 +8,7 @@ from transformers import PreTrainedTokenizer
 
 
 BASE_CHARS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-ADDITIONAL_CHARS = ["[", "]", "/", " ", ":", "|", "-", "_", ".", ",", "<", ">", "="]
+ADDITIONAL_CHARS = ["[", "]", "/", " ", ":", "|", "-", "_", ".", ",", "<", ">", "=", "\n"]
 
 
 class SimpleCharTokenizer(PreTrainedTokenizer):
@@ -93,6 +93,13 @@ class SimpleCharTokenizer(PreTrainedTokenizer):
             for idx in range(len(self._id_to_token)):
                 handle.write(self._id_to_token[idx] + "\n")
         return (vocab_path,)
+
+    def convert_tokens_to_string(self, tokens: List[str]) -> str:
+        """Join character tokens without introducing extra spaces."""
+
+        if not tokens:
+            return ""
+        return "".join(tokens)
 
 
 def build_tokenizer(extra_chars: Iterable[str] | None = None) -> SimpleCharTokenizer:

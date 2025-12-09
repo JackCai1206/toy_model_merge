@@ -14,25 +14,21 @@ ANALYSIS_SCRIPT="${REPO_DIR}/arithemtic_scaling_law/run_scaling_analysis.sh"
 
 # Centralize run-group naming inputs so both scripts share the same env.
 MODE="${MODE:-full}"
-TAG="${TAG:-}"
-ACC_TARGET="${ACC_TARGET:-0.90}"
-K_MIN="${K_MIN:-4}"
-K_MAX="${K_MAX:-17}"
-Q_KEEP=${Q_KEEP:-1.0}
-MAX_BLOCK_SIZE=${MAX_BLOCK_SIZE:-1}
+TAG="${TAG:-v2}"
+ACC_TARGET="${ACC_TARGET:-0.95}"
+K_MIN="${K_MIN:-8}"
+K_MAX="${K_MAX:-33}"
+Q_KEEP=${Q_KEEP:-0.8}
+MAX_STEPS_PER_BLOCK=${MAX_STEPS_PER_BLOCK:-2}
 RUN_NAME_PREFIX="${RUN_NAME_PREFIX:-seed_}"
-SEEDS="${SEEDS:-42 44 45 46 47}"
+SEEDS="${SEEDS:-42 43 44 45 46 47 48 49 50}"
 
-REGIME_SLUG="${REGIME_SLUG:-q${Q_KEEP//./}_b${MAX_BLOCK_SIZE}}"
+REGIME_SLUG="${REGIME_SLUG:-q${Q_KEEP//./}_b${MAX_STEPS_PER_BLOCK}}"
 K_SUFFIX="${K_SUFFIX:-}"
-if [[ -z "${K_SUFFIX}" ]]; then
-  if [[ "${K_MIN}" != "1" ]]; then
-    K_SUFFIX="kmin${K_MIN}_kmax${K_MAX}"
-  fi
-fi
+K_SUFFIX="kmin${K_MIN}_kmax${K_MAX}"
 RUN_GROUP="${RUN_GROUP:-run_${MODE}_${REGIME_SLUG}_t${ACC_TARGET}_${K_SUFFIX}_${TAG}}"
 
-export MODE TAG ACC_TARGET K_MIN K_MAX Q_KEEP MAX_BLOCK_SIZE REGIME_SLUG K_SUFFIX RUN_GROUP RUN_NAME_PREFIX SEEDS
+export MODE TAG ACC_TARGET K_MIN K_MAX Q_KEEP MAX_STEPS_PER_BLOCK REGIME_SLUG K_SUFFIX RUN_GROUP RUN_NAME_PREFIX SEEDS
 
 # Auto-derive array size from the seeds unless the user provided one.
 SEED_LIST=(${SEEDS})
@@ -40,7 +36,7 @@ if (( ${#SEED_LIST[@]} == 0 )); then
   echo "SEEDS is empty; provide at least one seed." >&2
   exit 1
 fi
-ARRAY_SPEC="--array=0-$(( ${#SEED_LIST[@]} - 1 ))"
+ARRAY_SPEC="--array=0-$(( ${#SEED_LIST[@]} - 1 ))%4"
 
 USER_SBATCH_ARGS=("$@")
 HAS_ARRAY=0
@@ -55,7 +51,8 @@ if (( ! HAS_ARRAY )); then
   EXP_SBATCH_ARGS+=("${ARRAY_SPEC}")
 fi
 
-EXP_SUBMIT_OUTPUT=$(sbatch "${EXP_SBATCH_ARGS[@]}" "${EXP_SCRIPT}")
+echo "Submitting experiments: sbatch ${EXP_SBATCH_ARGS[*]} ${EXP_SCRIPT}"
+EXP_SUBMIT_OUTPUT=$(sbatch --wait "${EXP_SBATCH_ARGS[@]}" "${EXP_SCRIPT}")
 echo "Submitted experiments: ${EXP_SUBMIT_OUTPUT}"
 EXP_JOB_ID=$(echo "${EXP_SUBMIT_OUTPUT}" | awk '/Submitted batch job/ {print $4}')
 if [[ -z "${EXP_JOB_ID}" ]]; then
@@ -63,5 +60,7 @@ if [[ -z "${EXP_JOB_ID}" ]]; then
   exit 1
 fi
 
-ANALYSIS_SUBMIT_OUTPUT=$(sbatch --dependency=afterok:${EXP_JOB_ID} --kill-on-invalid-dep=yes "${ANALYSIS_SCRIPT}")
-echo "Submitted analysis (afterok:${EXP_JOB_ID}): ${ANALYSIS_SUBMIT_OUTPUT}"
+# ANALYSIS_SUBMIT_OUTPUT=$(sbatch --dependency=afterok:${EXP_JOB_ID} --kill-on-invalid-dep=yes "${ANALYSIS_SCRIPT}")
+# echo "Submitted analysis (afterok:${EXP_JOB_ID}): ${ANALYSIS_SUBMIT_OUTPUT}"
+ANALYSIS_SUBMIT_OUTPUT=$(bash "${ANALYSIS_SCRIPT}")
+echo "Submitted analysis: ${ANALYSIS_SUBMIT_OUTPUT}"

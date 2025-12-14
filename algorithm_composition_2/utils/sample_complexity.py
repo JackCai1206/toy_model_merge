@@ -1,9 +1,4 @@
-"""Simple training helpers for estimating sample complexity.
-
-This module now runs a single vanilla training loop with periodic evaluations.
-Training stops once the configured metric crosses a threshold, and the primary
-result is the list of steps where the metric met or exceeded that threshold.
-"""
+"""Simple training helpers for estimating sample complexity."""
 
 from __future__ import annotations
 
@@ -109,19 +104,20 @@ def configure_training_args(
     save_total_limit: int = 1,
     scheduler_kwargs: Dict | None = None,
     eval_delay: int = 0,
-    torch_compile: bool = True,
-    use_liger_kernel: bool = False,
-    bf16: bool | None = None,
 ) -> TrainingArguments:
+    bf16 = False
+    if torch.cuda.is_available():
+        check = getattr(torch.cuda, "is_bf16_supported", None)
+        if callable(check):
+            bf16 = bool(check())
+        else:
+            major, _ = torch.cuda.get_device_capability()
+            bf16 = major >= 8
     warmup_steps = max(0, int(warmup_steps))
     eval_delay = max(0, int(eval_delay))
     lr_scheduler_kwargs = dict(scheduler_kwargs or {})
     if "num_decay_steps" not in lr_scheduler_kwargs:
         lr_scheduler_kwargs["num_decay_steps"] = warmup_steps
-
-    # Prefer bf16 when CUDA supports it (faster + stable), unless user overrides.
-    if bf16 is None:
-        bf16 = bool(torch.cuda.is_available()) and bool(torch.cuda.is_bf16_supported())
 
     return TrainingArguments(
         output_dir=output_dir,
@@ -145,13 +141,13 @@ def configure_training_args(
         save_steps=save_steps,
         save_total_limit=save_total_limit,
         report_to="none",
-    fp16=False,
-    bf16=bool(bf16),
+        fp16=False,
+        bf16=bf16,
         dataloader_drop_last=False,
         dataloader_num_workers=8,
         remove_unused_columns=False,
-        use_liger_kernel=bool(use_liger_kernel),
-        torch_compile=bool(torch_compile)
+        use_liger_kernel=False,
+        torch_compile=True,
     )
 
 
@@ -216,15 +212,8 @@ def train_with_eval_threshold(
     patience: int = 1,
     scheduler_kwargs: Dict | None = None,
     eval_delay: int = 0,
-    torch_compile: bool = True,
-    use_liger_kernel: bool = False,
-    bf16: bool | None = None,
 ) -> Tuple[CallbackOnlyTrainer, S99Callback, List[int]]:
-    """Train with periodic evals and stop once the metric meets the threshold.
-
-    Returns a tuple of (trainer, callback, threshold_steps) where threshold_steps
-    is the list of global steps whose evaluations met or exceeded the threshold.
-    """
+    """Train with periodic evals and stop once the metric meets the threshold."""
 
     _ensure_logging_initialized()
     logging_steps = logging_steps if logging_steps is not None else eval_steps
@@ -244,9 +233,6 @@ def train_with_eval_threshold(
         save_steps=None,
         save_total_limit=1,
         scheduler_kwargs=scheduler_kwargs,
-        torch_compile=torch_compile,
-        use_liger_kernel=use_liger_kernel,
-        bf16=bf16,
     )
     callback = S99Callback(metric_name=metric_name, threshold=success_threshold, patience=patience)
     trainer = CallbackOnlyTrainer(
@@ -310,11 +296,7 @@ def measure_sample_complexity_with_recursive_rollback(
     eval_delay: int = 0,
     **_: Any,
 ) -> Tuple[CallbackOnlyTrainer, S99Callback, List[int]]:
-    """Backwards-compatible shim that now uses a simple thresholded training loop.
-
-    Legacy parameters related to rollback are ignored but accepted to avoid breaking
-    existing callers. Warnings are emitted when non-default values are provided.
-    """
+    """Backwards-compatible shim that now uses a simple thresholded training loop."""
 
     if eval_refine_rounds != 1 or rollback_branches != 1:
         logger.warning(
@@ -358,6 +340,7 @@ __all__ = [
     "CallbackOnlyTrainer",
     "S99Callback",
     "configure_training_args",
+    "find_checkpoint_at_or_before",
     "list_checkpoint_steps",
     "train_with_eval_threshold",
     "measure_sample_complexity_with_recursive_rollback",

@@ -709,8 +709,11 @@ def train_level(
         sample_print_context=f"train_eval_k{k}",
     )
 
+    # Model construction. Request FlashAttention2 via Transformers when loading a checkpoint.
     if base_checkpoint:
-        model_builder = lambda: LlamaForCausalLM.from_pretrained(base_checkpoint)
+        model_builder = lambda: LlamaForCausalLM.from_pretrained(
+            base_checkpoint, attn_implementation="flash_attention_2"
+        )
         initial_model = model_builder()
     else:
         model_builder = lambda: build_model_from_tokenizer(tokenizer, args.context_length)
@@ -739,6 +742,8 @@ def train_level(
             metric_name="eval_acc_expr",
             warmup_steps=level_warmup,
             success_threshold=args.acc_target,
+            torch_compile=True,
+            use_liger_kernel=True,
         )
         first_hit = threshold_steps[0] if threshold_steps else None
         if first_hit is not None and first_hit <= eval_steps and eval_steps > args.eval_steps_min:

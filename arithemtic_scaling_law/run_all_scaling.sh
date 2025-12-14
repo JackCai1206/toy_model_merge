@@ -15,20 +15,32 @@ ANALYSIS_SCRIPT="${REPO_DIR}/arithemtic_scaling_law/run_scaling_analysis.sh"
 # Centralize run-group naming inputs so both scripts share the same env.
 MODE="${MODE:-full}"
 TAG="${TAG:-v2}"
-ACC_TARGET="${ACC_TARGET:-0.95}"
-K_MIN="${K_MIN:-8}"
-K_MAX="${K_MAX:-33}"
+ACC_TARGET="${ACC_TARGET:-0.90}"
+K_MIN="${K_MIN:-1}"
+# Optional sweep: space-separated list of k_min values.
+# If set, we will loop over these values and submit one sweep+analysis per k_min.
+# Example:
+#   K_MIN_LIST="1 2 4 8" bash arithemtic_scaling_law/run_all_scaling.sh
+K_MIN_LIST="${K_MIN_LIST:-1 4 16}"
+K_MAX="${K_MAX:-17}"
 Q_KEEP=${Q_KEEP:-0.8}
-MAX_STEPS_PER_BLOCK=${MAX_STEPS_PER_BLOCK:-2}
+MAX_STEPS_PER_BLOCK=${MAX_STEPS_PER_BLOCK:-1}
 RUN_NAME_PREFIX="${RUN_NAME_PREFIX:-seed_}"
-SEEDS="${SEEDS:-42 43 44 45 46 47 48 49 50}"
+SEEDS="${SEEDS:-42 43 44 45 46 47 48 49}"
 
 REGIME_SLUG="${REGIME_SLUG:-q${Q_KEEP//./}_b${MAX_STEPS_PER_BLOCK}}"
-K_SUFFIX="${K_SUFFIX:-}"
-K_SUFFIX="kmin${K_MIN}_kmax${K_MAX}"
-RUN_GROUP="${RUN_GROUP:-run_${MODE}_${REGIME_SLUG}_t${ACC_TARGET}_${K_SUFFIX}_${TAG}}"
 
-export MODE TAG ACC_TARGET K_MIN K_MAX Q_KEEP MAX_STEPS_PER_BLOCK REGIME_SLUG K_SUFFIX RUN_GROUP RUN_NAME_PREFIX SEEDS
+# If K_MIN_LIST isn't provided, default to the single K_MIN value.
+if [[ -z "${K_MIN_LIST}" ]]; then
+  K_MIN_LIST="${K_MIN}"
+fi
+
+# If the user explicitly set RUN_GROUP, we respect it only when not sweeping.
+USER_PROVIDED_RUN_GROUP="${RUN_GROUP:-}"
+IS_SWEEP=0
+if [[ "${K_MIN_LIST}" == *" "* ]]; then
+  IS_SWEEP=1
+fi
 
 # Auto-derive array size from the seeds unless the user provided one.
 SEED_LIST=(${SEEDS})
@@ -36,7 +48,7 @@ if (( ${#SEED_LIST[@]} == 0 )); then
   echo "SEEDS is empty; provide at least one seed." >&2
   exit 1
 fi
-ARRAY_SPEC="--array=0-$(( ${#SEED_LIST[@]} - 1 ))%4"
+ARRAY_SPEC="--array=0-$(( ${#SEED_LIST[@]} - 1 ))"
 
 USER_SBATCH_ARGS=("$@")
 HAS_ARRAY=0
@@ -51,16 +63,29 @@ if (( ! HAS_ARRAY )); then
   EXP_SBATCH_ARGS+=("${ARRAY_SPEC}")
 fi
 
-echo "Submitting experiments: sbatch ${EXP_SBATCH_ARGS[*]} ${EXP_SCRIPT}"
-EXP_SUBMIT_OUTPUT=$(sbatch --wait "${EXP_SBATCH_ARGS[@]}" "${EXP_SCRIPT}")
-echo "Submitted experiments: ${EXP_SUBMIT_OUTPUT}"
-EXP_JOB_ID=$(echo "${EXP_SUBMIT_OUTPUT}" | awk '/Submitted batch job/ {print $4}')
-if [[ -z "${EXP_JOB_ID}" ]]; then
-  echo "Could not parse experiment job ID from sbatch output: ${EXP_SUBMIT_OUTPUT}" >&2
-  exit 1
-fi
+for K_MIN in ${K_MIN_LIST}; do
+  # Recompute suffix + run-group per K_MIN so artifacts/results don't collide.
+  K_SUFFIX="kmin${K_MIN}_kmax${K_MAX}"
+  if (( IS_SWEEP == 1 )); then
+    RUN_GROUP="run_${MODE}_${REGIME_SLUG}_t${ACC_TARGET}_${K_SUFFIX}_${TAG}"
+  else
+    RUN_GROUP="${USER_PROVIDED_RUN_GROUP:-run_${MODE}_${REGIME_SLUG}_t${ACC_TARGET}_${K_SUFFIX}_${TAG}}"
+  fi
 
-# ANALYSIS_SUBMIT_OUTPUT=$(sbatch --dependency=afterok:${EXP_JOB_ID} --kill-on-invalid-dep=yes "${ANALYSIS_SCRIPT}")
-# echo "Submitted analysis (afterok:${EXP_JOB_ID}): ${ANALYSIS_SUBMIT_OUTPUT}"
-ANALYSIS_SUBMIT_OUTPUT=$(bash "${ANALYSIS_SCRIPT}")
-echo "Submitted analysis: ${ANALYSIS_SUBMIT_OUTPUT}"
+  export MODE TAG ACC_TARGET K_MIN K_MAX Q_KEEP MAX_STEPS_PER_BLOCK REGIME_SLUG K_SUFFIX RUN_GROUP RUN_NAME_PREFIX SEEDS
+
+  echo "=== K_MIN=${K_MIN} K_MAX=${K_MAX} RUN_GROUP=${RUN_GROUP} ==="
+  echo "Submitting experiments: sbatch ${EXP_SBATCH_ARGS[*]} ${EXP_SCRIPT}"
+  EXP_SUBMIT_OUTPUT=$(sbatch --wait "${EXP_SBATCH_ARGS[@]}" "${EXP_SCRIPT}")
+  echo "Submitted experiments: ${EXP_SUBMIT_OUTPUT}"
+  EXP_JOB_ID=$(echo "${EXP_SUBMIT_OUTPUT}" | awk '/Submitted batch job/ {print $4}')
+  if [[ -z "${EXP_JOB_ID}" ]]; then
+    echo "Could not parse experiment job ID from sbatch output: ${EXP_SUBMIT_OUTPUT}" >&2
+    exit 1
+  fi
+
+  # ANALYSIS_SUBMIT_OUTPUT=$(sbatch --dependency=afterok:${EXP_JOB_ID} --kill-on-invalid-dep=yes "${ANALYSIS_SCRIPT}")
+  # echo "Submitted analysis (afterok:${EXP_JOB_ID}): ${ANALYSIS_SUBMIT_OUTPUT}"
+  ANALYSIS_SUBMIT_OUTPUT=$(bash "${ANALYSIS_SCRIPT}")
+  echo "Submitted analysis: ${ANALYSIS_SUBMIT_OUTPUT}"
+done

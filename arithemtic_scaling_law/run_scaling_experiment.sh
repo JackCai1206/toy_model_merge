@@ -35,6 +35,7 @@ export HF_HUB_DISABLE_PROGRESS_BARS=1
 TAG="${TAG:-}"
 MODE="${MODE:-full}"
 SEED_LIST=(${SEEDS:-42 44 45 46 47})
+SKIP_EXISTING="${SKIP_EXISTING:-1}"
 if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   if [[ "${SLURM_ARRAY_TASK_ID}" -lt 0 || "${SLURM_ARRAY_TASK_ID}" -ge "${#SEED_LIST[@]}" ]]; then
     echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID} is out of range for SEED_LIST (${#SEED_LIST[@]} entries)" >&2
@@ -58,7 +59,7 @@ CONTEXT_LENGTH=${CONTEXT_LENGTH:-2048}
 PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-128}
 PER_DEVICE_EVAL_BATCH_SIZE=${PER_DEVICE_EVAL_BATCH_SIZE:-1024}
 GRAD_ACCUM=${GRAD_ACCUM:-1}
-EVAL_STEPS=${EVAL_STEPS:-500}
+EVAL_STEPS=${EVAL_STEPS:-250}
 EVAL_STEPS_MIN=${EVAL_STEPS_MIN:-5}
 EVAL_STEPS_MAX=${EVAL_STEPS_MAX:-1000}
 EVAL_JITTER_FRACTION=${EVAL_JITTER_FRACTION:-0.5}
@@ -128,7 +129,12 @@ for SEED in ${SEEDS}; do
     --seed "${SEED}"
     --run_name "${RUN_NAME}"
     --run_group "${RUN_GROUP}"
+    --eval_print_examples 0
   )
+
+  if [[ "${SKIP_EXISTING}" == "0" ]]; then
+    CMD+=(--no-skip_existing)
+  fi
 
   CMD+=(--q_keep "${Q_KEEP}")
   CMD+=(--max_steps_per_block "${MAX_STEPS_PER_BLOCK}")

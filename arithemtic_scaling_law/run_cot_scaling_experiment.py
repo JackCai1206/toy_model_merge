@@ -742,8 +742,8 @@ def train_level(
             metric_name="eval_acc_expr",
             warmup_steps=level_warmup,
             success_threshold=args.acc_target,
-            torch_compile=True,
-            use_liger_kernel=True,
+            torch_compile=False,
+            use_liger_kernel=False,
         )
         first_hit = threshold_steps[0] if threshold_steps else None
         if first_hit is not None and first_hit <= eval_steps and eval_steps > args.eval_steps_min:
@@ -904,6 +904,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup_steps", type=int, default=600, help="Optimizer warmup steps.")
     parser.add_argument("--acc_target", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--skip_existing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip levels that already have a completed results JSON + checkpoint (default: true).",
+    )
     return parser.parse_args()
 
 
@@ -932,11 +938,55 @@ def main() -> None:
     current_eval_steps = max(args.eval_steps_min, args.eval_steps)
     eval_steps_max = args.eval_steps_max if args.eval_steps_max is None or args.eval_steps_max > 0 else None
 
+    # If we encounter an invalid/missing level, we should invalidate (rerun) all subsequent levels
+    # because they were trained from an inconsistent base_checkpoint chain.
+    skip_chain_intact = True
+
     for idx, k in enumerate(range(args.k_min, args.k_max), start=1):
         print(
             f"=== Training level k={k} ({idx}/{total_levels}) | regime={regime.slug} | run_group={run_group} | run_name={run_name} ===",
             flush=True,
         )
+
+        if args.skip_existing and skip_chain_intact:
+            # Skip work if this level was already completed (based on a valid results JSON).
+            result_path = os.path.join(args.results_dir, f"level_k{k}_{regime.slug}.json")
+            if os.path.isfile(result_path):
+                try:
+                    with open(result_path, "r", encoding="utf-8") as handle:
+                        prior = json.load(handle)
+
+                    # Treat as complete only if it has the expected completion fields.
+                    prior_k = prior.get("k")
+                    prior_steps = prior.get("threshold_steps")
+                    prior_s99 = prior.get("s99_steps")
+                    prior_ckpt = prior.get("checkpoint")
+                    prior_metrics = prior.get("metrics")
+                    is_complete = (
+                        prior_k == k
+                        and isinstance(prior_steps, list)
+                        and len(prior_steps) > 0
+                        and isinstance(prior_s99, int)
+                        and isinstance(prior_ckpt, str)
+                        and os.path.isdir(prior_ckpt)
+                        and isinstance(prior_metrics, dict)
+                        and "eval_acc_expr" in prior_metrics
+                    )
+
+                    if is_complete:
+                        base_checkpoint = prior_ckpt
+                        print(
+                            f"[level k={k}] Skipping: found completed result {os.path.basename(result_path)}",
+                            flush=True,
+                        )
+                        continue
+                except Exception:
+                    # If parsing fails or fields are missing, fall through and rerun the level.
+                    pass
+
+            # If skipping is enabled but we didn't successfully skip this level, the chain is now invalidated.
+            # Subsequent levels must be rerun even if their results exist.
+            skip_chain_intact = False
         rng = random.Random(args.seed * 7919 + k)
         level_eval_steps = current_eval_steps
         attempt = 0
